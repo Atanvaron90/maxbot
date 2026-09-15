@@ -24,12 +24,12 @@ import urllib.error
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 from typing import Dict, Optional, List
-
 from dotenv import load_dotenv
 from maxapi import Bot, Dispatcher, F
 from maxapi.types import (
     MessageCreated, BotStarted, MessageCallback, Command,
-    CallbackButton, ButtonsPayload, Attachment, BotCommand
+    CallbackButton, ButtonsPayload, Attachment, BotCommand,
+    InputMediaBuffer
 )
 from maxapi.enums.intent import Intent
 
@@ -1783,23 +1783,44 @@ async def cmd_reply(event: MessageCreated):
 
 # ---------- ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ ДЛЯ КАРТИНОК ----------
 
-async def send_image(chat_id: int, image_url: str, caption: str = ""):
-    if not image_url:
-        logger.warning("URL изображения не указан")
+async def send_image(chat_id: int, image_path_or_url: str, caption: str = ""):
+    """CHANGED: URL — отправка по ссылке как раньше; локальный путь —
+    загрузка файла в MAX через upload_media и отправка готового вложения."""
+    if not image_path_or_url:
+        logger.warning("Путь/URL изображения не указан")
         return
     try:
-        image_attachment = Attachment(
-            type="image",
-            payload={"url": image_url}
-        )
-        await bot.send_message(
-            chat_id=chat_id,
-            text=caption,
-            attachments=[image_attachment]
-        )
-        logger.info(f"Отправлено изображение по URL: {image_url}")
+        if image_path_or_url.startswith("http"):
+            # как раньше: вложение по URL
+            image_attachment = Attachment(type="image", payload={"url": image_path_or_url})
+            await bot.send_message(chat_id=chat_id, text=caption,
+                                   attachments=[image_attachment])
+        else:
+            # локальный файл: читаем и загружаем в MAX
+            if not os.path.exists(image_path_or_url):
+                logger.warning(f"Файл не найден: {image_path_or_url}")
+                return
+            with open(image_path_or_url, "rb") as f:
+                data = f.read()
+            media = InputMediaBuffer(
+                buffer=data,
+                filename=os.path.basename(image_path_or_url),
+                type="image"
+            )
+            uploaded = await bot.upload_media(media)
+            # upload_media может вернуть готовый Attachment или токен-строку —
+            # обрабатываем оба варианта
+            if isinstance(uploaded, Attachment):
+                attachments = [uploaded]
+            elif isinstance(uploaded, str):
+                attachments = [Attachment(type="image", payload={"token": uploaded})]
+            else:
+                attachments = [uploaded]
+            await bot.send_message(chat_id=chat_id, text=caption, attachments=attachments)
+
+        logger.info(f"Изображение отправлено: {image_path_or_url}")
     except Exception as e:
-        logger.error(f"Ошибка отправки изображения {image_url}: {e}")
+        logger.error(f"Ошибка отправки изображения {image_path_or_url}: {e}")
 
 
 # ---------- ОСНОВНОЙ ОБРАБОТЧИК ТЕКСТА ----------
