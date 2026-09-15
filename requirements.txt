@@ -1,0 +1,4 @@
+maxapi
+python-dotenv
+openpyxl
+tzdata
