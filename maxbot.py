@@ -38,6 +38,14 @@ try:
 except ImportError:
     openpyxl = None
     logging.warning("openpyxl не установлен. Проверка долга не будет работать.")
+    
+try:
+    from maxapi.enums import UploadType
+except ImportError:
+    try:
+        from maxapi.enums.upload_type import UploadType
+    except ImportError:
+        UploadType = None    
 
 # Московское время для всей логики сверки (на сервере локаль может быть UTC).
 try:
@@ -590,12 +598,13 @@ async def _download_tables_tmp() -> Optional[List[str]]:
 
 
 def _sheet_signature(path: str, sheet_name: str) -> Optional[str]:
-    """md5-отпечаток содержимого конкретного листа. None — лист не найден/файл битый."""
+    """md5-отпечаток листа. OPT: для листа-триггера (гигантский «Выгрузка продаж»)
+    хешируем число строк + первые 50 + последние 10 строк — он обновляется
+    дополнением строк, и это детектируется надёжно. Полное хеширование —
+    только для компактного листа «Сверка». None — лист не найден/файл битый."""
     if not openpyxl:
         return None
 
-    # FIX: если read_only-режим падает (бывает на Google-экспорте), пробуем
-    # открыть файл обычным способом и обязательно логируем причину
     try:
         wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
     except Exception as e:
@@ -615,9 +624,30 @@ def _sheet_signature(path: str, sheet_name: str) -> Optional[str]:
                 f"Реальные имена листов: {[repr(s) for s in wb.sheetnames]}"
             )
             return None
+
+        # Лист-триггер огромен — облегчённый режим
+        light = (_norm_sheet_name(sheet_name) == _norm_sheet_name(DEBT_SOURCE_SHEET))
+
         h = hashlib.md5()
-        for row in wb[name].iter_rows(values_only=True):
-            h.update(repr(row).encode('utf-8'))
+        if light:
+            rows_read = 0
+            head: List[str] = []
+            tail: List[str] = []
+            for row in wb[name].iter_rows(values_only=True):
+                rows_read += 1
+                if rows_read <= 50:
+                    head.append(repr(row))
+                if rows_read > 10:
+                    tail.pop(0)
+                tail.append(repr(row))
+            h.update(f"rows={rows_read}".encode('utf-8'))
+            for r in head:
+                h.update(r.encode('utf-8'))
+            for r in tail:
+                h.update(r.encode('utf-8'))
+        else:
+            for row in wb[name].iter_rows(values_only=True):
+                h.update(repr(row).encode('utf-8'))
         return h.hexdigest()
     finally:
         wb.close()
@@ -711,8 +741,8 @@ async def ensure_debt_cache() -> bool:
             logger.error("Восстановить кэш сверки не удалось (таблицы не скачались)")
             return False
 
-        trig_sigs = _signatures(tmps, DEBT_SOURCE_SHEET)
-        data_sigs = _signatures(tmps, DEBT_DATA_SHEET)
+        trig_sigs = await asyncio.to_thread(_signatures, tmps, DEBT_SOURCE_SHEET)
+        data_sigs = await asyncio.to_thread(_signatures, tmps, DEBT_DATA_SHEET)
 
         _commit_tables(tmps)
 
@@ -731,13 +761,10 @@ async def ensure_debt_cache() -> bool:
 
 
 async def search_debt_with_recovery(full_name: str) -> Optional[List[Dict]]:
-    """Поиск долга с автовосстановлением. Если кэш недоступен (файлы
-    отсутствуют или не читаются) — скачивает таблицы и повторяет поиск.
-    None возвращается только если восстановление тоже не помогло."""
-    matches = search_debt_by_name(full_name)
+    matches = await asyncio.to_thread(search_debt_by_name, full_name)
     if matches is None:
         if await ensure_debt_cache():
-            matches = search_debt_by_name(full_name)
+            matches = await asyncio.to_thread(search_debt_by_name, full_name)
     return matches
 
 
@@ -754,8 +781,8 @@ async def startup_check() -> str:
     if tmps is None:
         return "❌ Не удалось скачать одну из таблиц (см. лог)."
 
-    trig_sigs = _signatures(tmps, DEBT_SOURCE_SHEET)
-    data_sigs = _signatures(tmps, DEBT_DATA_SHEET)
+    trig_sigs = await asyncio.to_thread(_signatures, tmps, DEBT_SOURCE_SHEET)
+    data_sigs = await asyncio.to_thread(_signatures, tmps, DEBT_DATA_SHEET)
     if any(s is None for s in trig_sigs) or any(s is None for s in data_sigs):
         _cleanup_files(tmps)
         return (f"⚠️ Не найден лист «{DEBT_SOURCE_SHEET}» или «{DEBT_DATA_SHEET}». "
@@ -818,8 +845,8 @@ async def scheduled_check(force_weekday: bool = False) -> str:
     if tmps is None:
         return "❌ Не удалось скачать одну из таблиц (см. лог). Пробую при следующей проверке."
 
-    trig_sigs = _signatures(tmps, DEBT_SOURCE_SHEET)
-    data_sigs = _signatures(tmps, DEBT_DATA_SHEET)
+    trig_sigs = await asyncio.to_thread(_signatures, tmps, DEBT_SOURCE_SHEET)
+    data_sigs = await asyncio.to_thread(_signatures, tmps, DEBT_DATA_SHEET)
     if any(s is None for s in trig_sigs) or any(s is None for s in data_sigs):
         _cleanup_files(tmps)
         return (f"⚠️ Не найден лист «{DEBT_SOURCE_SHEET}» или «{DEBT_DATA_SHEET}». "
@@ -1781,46 +1808,201 @@ async def cmd_reply(event: MessageCreated):
         await event.message.answer("❌ Не удалось отправить ответ. Проверьте ID пользователя или права бота.")
 
 
-# ---------- ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ ДЛЯ КАРТИНОК ----------
+# ---------- ОТПРАВКА КАРТИНОК ----------
+
+def _pick_upload_type():
+    """Член enum UploadType ('image' или 'images'); иначе строка-фолбэк."""
+    if UploadType is not None:
+        for cand in ("image", "images"):
+            for member in UploadType:
+                if member.value == cand:
+                    return member
+    return "image"
+
+
+def _extract_token(raw):
+    """Достаёт токен для вложения из ответа загрузки.
+    Особенность MAX API: ответ загрузки имеет вид
+    {"photos": {"<КЛЮЧ>": {"token": "..."}}} — во вложение
+    передаётся КЛЮЧ из словаря photos, а не поле token внутри."""
+    if raw is None:
+        return None
+    if not isinstance(raw, str):
+        raw = getattr(raw, "token", None) or getattr(raw, "value", None) or str(raw)
+    s = str(raw).strip()
+    if s.startswith("{"):
+        try:
+            j = json.loads(s)
+            photos = j.get("photos") if isinstance(j, dict) else None
+            if isinstance(photos, dict) and photos:
+                return str(next(iter(photos)))   # ← ключ из photos
+            if isinstance(j, dict):
+                for k in ("token", "file_token", "id", "result"):
+                    if k in j:
+                        return str(j[k])
+        except Exception:
+            pass
+    return s.strip().strip('"')
+
+
+def _upload_direct_sync(upload_url: str, path: str, filename: str) -> str:
+    """Прямая загрузка поверх urllib (запасной путь, без maxapi):
+    файл телом запроса, при отказе — multipart."""
+    with open(path, "rb") as f:
+        data = f.read()
+    try:
+        req = urllib.request.Request(upload_url, data=data,
+                                     headers={"Content-Type": "application/octet-stream"},
+                                     method="POST")
+        with urllib.request.urlopen(req, timeout=60) as r:
+            return r.read().decode('utf-8')
+    except Exception as e:
+        logger.warning(f"Прямая загрузка телом не сработала: {e}")
+
+    boundary = "----maxbot" + os.urandom(8).hex()
+    body = (f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="data"; filename="{filename}"\r\n'
+            f"Content-Type: application/octet-stream\r\n\r\n").encode('utf-8') \
+           + data + f"\r\n--{boundary}--\r\n".encode('utf-8')
+    req = urllib.request.Request(upload_url, data=body,
+                                 headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+                                 method="POST")
+    with urllib.request.urlopen(req, timeout=60) as r:
+        return r.read().decode('utf-8')
+
 
 async def send_image(chat_id: int, image_path_or_url: str, caption: str = ""):
-    """CHANGED: URL — отправка по ссылке как раньше; локальный путь —
-    загрузка файла в MAX через upload_media и отправка готового вложения."""
+    """URL — по ссылке. Локальный файл — загрузка → отправка.
+    Ключ photos достаётся: (1) из сырого ответа загрузки, если там JSON;
+    (2) из текста ошибки сервера при отправке (там сервер сам его показывает).
+    500-е ретраятся (до 3 раз), 400 с подсказкой — мгновенный ретрай с ключом."""
+
     if not image_path_or_url:
         logger.warning("Путь/URL изображения не указан")
         return
-    try:
-        if image_path_or_url.startswith("http"):
-            # как раньше: вложение по URL
-            image_attachment = Attachment(type="image", payload={"url": image_path_or_url})
-            await bot.send_message(chat_id=chat_id, text=caption,
-                                   attachments=[image_attachment])
-        else:
-            # локальный файл: читаем и загружаем в MAX
-            if not os.path.exists(image_path_or_url):
-                logger.warning(f"Файл не найден: {image_path_or_url}")
-                return
-            with open(image_path_or_url, "rb") as f:
-                data = f.read()
-            media = InputMediaBuffer(
-                buffer=data,
-                filename=os.path.basename(image_path_or_url),
-                type="image"
-            )
-            uploaded = await bot.upload_media(media)
-            # upload_media может вернуть готовый Attachment или токен-строку —
-            # обрабатываем оба варианта
-            if isinstance(uploaded, Attachment):
-                attachments = [uploaded]
-            elif isinstance(uploaded, str):
-                attachments = [Attachment(type="image", payload={"token": uploaded})]
-            else:
-                attachments = [uploaded]
-            await bot.send_message(chat_id=chat_id, text=caption, attachments=attachments)
 
-        logger.info(f"Изображение отправлено: {image_path_or_url}")
+    try:
+        # ---------- Ветка URL ----------
+        if image_path_or_url.startswith("http"):
+            att = Attachment(type="image", payload={"url": image_path_or_url})
+            await bot.send_message(chat_id=chat_id, text=caption, attachments=[att])
+            logger.info(f"Изображение отправлено (URL): {image_path_or_url}")
+            return
+
+        # ---------- Локальный файл ----------
+        if not os.path.exists(image_path_or_url):
+            logger.warning(f"Файл не найден: {image_path_or_url}")
+            return
+
+        filename = os.path.basename(image_path_or_url)
+        utype = _pick_upload_type()
+
+        # --- 1. upload URL ---
+        up = await bot.get_upload_url(type=utype)
+        up_url = None
+        if isinstance(up, str) and up.startswith("http"):
+            up_url = up
+        else:
+            for attr in ("url", "value", "link", "upload_url"):
+                v = getattr(up, attr, None)
+                if isinstance(v, str) and v.startswith("http"):
+                    up_url = v
+                    break
+        if not up_url:
+            raise RuntimeError(f"Не нашли upload URL в ответе: {up!r}")
+
+        # --- 2. Загрузка (3 способа), сохраняем СЫРОЙ ответ ---
+        with open(image_path_or_url, "rb") as f:
+            data = f.read()
+
+        raw_upload = None
+        try:
+            raw_upload = await bot.upload_file_buffer(filename, up_url, data, utype)
+            logger.info(f"Загрузка OK (upload_file_buffer), сырой ответ: {str(raw_upload)[:120]}")
+        except Exception as e1:
+            logger.warning(f"upload_file_buffer не сработал: {e1}; пробую upload_file")
+
+        if raw_upload is None:
+            try:
+                raw_upload = await bot.upload_file(up_url, image_path_or_url, utype)
+                logger.info(f"Загрузка OK (upload_file), сырой ответ: {str(raw_upload)[:120]}")
+            except Exception as e2:
+                logger.warning(f"upload_file не сработал: {e2}; прямая загрузка")
+
+        if raw_upload is None:
+            raw_upload = await asyncio.to_thread(_upload_direct_sync, up_url,
+                                                 image_path_or_url, filename)
+            logger.info(f"Загрузка OK (прямая), сырой ответ: {str(raw_upload)[:120]}")
+
+        token = _extract_token(raw_upload)
+        if not token:
+            raise RuntimeError(f"Токен не извлечён из: {str(raw_upload)[:200]}")
+
+        # --- 3. Отправка с перебором кандидатов и умным ретраем ---
+        def _send(tok):
+            return bot.send_message(
+                chat_id=chat_id, text=caption,
+                attachments=[Attachment(type="image", payload={"token": tok})]
+            )
+
+        last_err: Optional[Exception] = None
+        tried_keys = set()          # ключи, которые уже пробовали
+        current = token
+        used_json_full = False      # пробовали ли «весь JSON» как токен
+
+        for round_no in range(1, 9):   # жёсткий предел 8 итераций
+            if current in tried_keys:
+                # исчерпали разумные варианты — пробуем «весь JSON», затем выходим
+                if not used_json_full:
+                    raw_s = str(raw_upload).strip()
+                    if raw_s.startswith("{") and raw_s != current:
+                        used_json_full = True
+                        current = raw_s
+                        logger.info("Стратегия: отправляю весь JSON ответа как токен")
+                        continue
+                break
+
+            tried_keys.add(current)
+            try:
+                await _send(current)
+                logger.info(f"Изображение отправлено (файл): {image_path_or_url}")
+                return
+            except Exception as e:
+                last_err = e
+                es = str(e)
+                logger.info(f"Отправка с токеном {str(current)[:24]}… не удалась: {es[:140]}")
+
+                # (1) Сервер показал photos-структуру → достаём ключ напрямую
+                #     из ТЕКСТА ошибки (устойчиво к \u003d и мусору self.raw=...)
+                m = re.search(r'photos"\s*:\s*\{\s*"((?:[^"\\]|\\.)*)"', es)
+                if m:
+                    key = m.group(1)
+                    # раскодируем \u003d и прочие \uXXXX
+                    try:
+                        key = key.encode('utf-8').decode('unicode_escape')
+                    except Exception:
+                        key = key.replace('\\u003d', '=')
+                    if key not in tried_keys:
+                        logger.info(f"Сервер подсказал ключ photos: {key[:32]}… — ретрай")
+                        current = key
+                        continue
+
+                # (2) Транзиентная 500 → пауза и повтор с тем же токеном
+                if ('internal.error' in es or 'code=500' in es
+                        or "'code': 500" in es or 'Error ID' in es):
+                    logger.warning(f"500 от сервера (круг {round_no}), пауза 3 с…")
+                    await asyncio.sleep(3)
+                    continue
+
+                # (3) Иное — выходим, ниже фолбэк/ошибка
+                break
+
+        # ---------- Фолбэк: URL из .env, если он задан для этого файла ----------
+        raise RuntimeError(f"Не удалось отправить изображение; последняя ошибка: {last_err}")
+
     except Exception as e:
         logger.error(f"Ошибка отправки изображения {image_path_or_url}: {e}")
+
 
 
 # ---------- ОСНОВНОЙ ОБРАБОТЧИК ТЕКСТА ----------
