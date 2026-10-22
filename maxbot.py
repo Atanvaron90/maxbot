@@ -2,12 +2,15 @@
 MAX Bot — бот с поддержкой, информацией, условиями, рассылкой и проверкой долга.
 Двухуровневая система обновления сверки из Google Таблиц:
   1) Триггеры (лист «Выгрузка продаж 5-ка») — ТОЛЬКО понедельник, раз в 15 мин,
-     пока не обновятся в ОБОИХ таблицах; затем до следующего понедельника не проверяются.
-     Зачёт = подмена сверки + рассылка всем пользователям.
+     пока не обновятся в ОБОИХ таблицах. Зачёт (и рассылка всем) — только при
+     ГЛУБОКОМ обновлении: у обеих таблиц изменилось число НЕПУСТЫХ строк.
   2) Лист «Сверка» — пн: раз в 15 мин, вт–пт: раз в 30 мин, сб–вс: не проверяется.
-     Изменения подхватываются тихо (без уведомлений).
-Автовосстановление: если кэш-файлы сверки отсутствуют/не читаются,
-при запросе долга бот скачивает таблицы автоматически и повторяет поиск.
+Контроль нового года: раз в неделю бот проверяет метку года в
+«Исходные данные»!A2 первой таблицы; если метка устарела — предупреждение владельцу.
+Администраторы: владелец (ADMIN_ID) + динамические (/addadmin, /deladmin, /adminlist,
+кнопки ➕/➖ в меню владельца), хранятся в data/admins.json.
+Команды: /start /menu, /help, /debt, /change_name, /cancel, /broadcast, /userinfo,
+/refresh_debt, /debt_status, /addadmin, /deladmin, /adminlist.
 """
 
 import os
@@ -23,7 +26,8 @@ import urllib.request
 import urllib.error
 from datetime import datetime, timedelta, timezone
 from enum import Enum
-from typing import Dict, Optional, List
+from typing import Dict, Optional, List, Set
+
 from dotenv import load_dotenv
 from maxapi import Bot, Dispatcher, F
 from maxapi.types import (
@@ -38,16 +42,15 @@ try:
 except ImportError:
     openpyxl = None
     logging.warning("openpyxl не установлен. Проверка долга не будет работать.")
-    
+
 try:
     from maxapi.enums import UploadType
 except ImportError:
     try:
         from maxapi.enums.upload_type import UploadType
     except ImportError:
-        UploadType = None    
+        UploadType = None
 
-# Московское время для всей логики сверки (на сервере локаль может быть UTC).
 try:
     from zoneinfo import ZoneInfo
     MSK = ZoneInfo("Europe/Moscow")
@@ -58,7 +61,6 @@ load_dotenv()
 
 DEBUG = os.getenv("DEBUG", "false").lower() == "true"
 
-# FIX ENC: консоль Windows в cp1251 не умеет эмодзи — переводим потоки в UTF-8
 try:
     sys.stdout.reconfigure(encoding='utf-8', errors='replace')
     sys.stderr.reconfigure(encoding='utf-8', errors='replace')
@@ -69,7 +71,7 @@ logging.basicConfig(
     level=logging.DEBUG if DEBUG else logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler("bot.log", encoding="utf-8"),  # FIX ENC: файл в UTF-8
+        logging.FileHandler("bot.log", encoding="utf-8"),
         logging.StreamHandler()
     ]
 )
@@ -77,22 +79,30 @@ logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.getenv("MAX_BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+ADMINS_FILE = os.getenv("ADMINS_FILE", "data/admins.json")
 USERS_FILE = 'data/users.json'
 
-# ID Google Таблиц через запятую (одна, две или больше)
 DEBT_SHEET_IDS: List[str] = [s.strip() for s in os.getenv("DEBT_SHEET_IDS", "").split(",") if s.strip()]
 DEBT_DIR = os.getenv("DEBT_DIR", "data/debt")
 
-# Имена листов
-DEBT_DATA_SHEET = os.getenv("DEBT_DATA_SHEET", "Сверка")                    # лист с долгами
-DEBT_SOURCE_SHEET = os.getenv("DEBT_SOURCE_SHEET", "Выгрузка продаж 5-ка")  # лист-триггер
+DEBT_DATA_SHEET = os.getenv("DEBT_DATA_SHEET", "Сверка")
+DEBT_SOURCE_SHEET = os.getenv("DEBT_SOURCE_SHEET", "Выгрузка продаж 5-ка")
+# Столбец-триггер недельного обновления: заголовок в листе «Выгрузка продаж 5-ка».
+# Уведомление о сверке уходит только при изменении данных в этом столбце
+# (в обеих таблицах). Частичное заполнение других столбцов не считается.
+TRIG_COLUMN_HEADER = os.getenv("TRIG_COLUMN_HEADER", "Количество")
+_TRIG_COLUMN_ALIASES = {'количество', 'кол-во', 'колво'}
+DEBT_YEAR_CELL = os.getenv("DEBT_YEAR_CELL", "Исходные данные!A2")
+DEBT_YEAR_CHECK_WD = int(os.getenv("DEBT_YEAR_CHECK_WD", "0"))
+DEBT_YEAR_CHECK_HOUR = int(os.getenv("DEBT_YEAR_CHECK_HOUR", "9"))
 
-# Интервалы проверки (минуты): понедельник — 15, вт–пт — 30, сб–вс — не проверяем
 DEBT_CHECK_MONDAY_MINUTES = int(os.getenv("DEBT_CHECK_MONDAY_MINUTES", "15"))
 DEBT_CHECK_WEEKDAY_MINUTES = int(os.getenv("DEBT_CHECK_WEEKDAY_MINUTES", "30"))
-
-# Файл состояния (переживает перезапуски бота)
+DEBT_MIN_DOWNLOAD_MINUTES = int(os.getenv("DEBT_MIN_DOWNLOAD_MINUTES", "10"))
 DEBT_STATE_FILE = os.getenv("DEBT_STATE_FILE", "data/debt_state.json")
+
+DOWNLOAD_TIMEOUT = int(os.getenv("DOWNLOAD_TIMEOUT", "120"))
+DOWNLOAD_RETRIES = int(os.getenv("DOWNLOAD_RETRIES", "3"))
 
 REGION1_APP = os.getenv("REGION1_APP", "https://example.com/app1.jpg")
 REGION1_QR = os.getenv("REGION1_QR", "https://example.com/qr1.jpg")
@@ -108,20 +118,22 @@ if not BOT_TOKEN:
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-KNOWN_COMMANDS = {'/start', '/help', '/debt', '/change_name', '/cancel',
-                  '/broadcast', '/reply', '/userinfo',
-                  '/refresh_debt', '/debt_status'}
+KNOWN_COMMANDS = {'/start', '/menu', '/help', '/debt', '/change_name', '/cancel',
+                  '/broadcast', '/userinfo',
+                  '/refresh_debt', '/debt_status',
+                  '/addadmin', '/deladmin', '/adminlist'}
 
 
 class UserState(Enum):
     IDLE = "idle"
-    SUPPORT_MODE = "support"
     BROADCAST_MODE = "broadcast"
     DEBT_NAME_MODE = "debt_name"
     DEBT_CLARIFY_MODE = "debt_clarify"
     WAITING_FOR_FORWARD = "waiting_for_forward"
     ADMIN_DEBT_MODE = "admin_debt"
     ADMIN_DEBT_CLARIFY_MODE = "admin_debt_clarify"
+    WAITING_ADDADMIN_ID = "waiting_addadmin_id"
+    WAITING_DELADMIN_ID = "waiting_deladmin_id"
 
 
 user_states: Dict[int, UserState] = {}
@@ -131,13 +143,55 @@ admin_debt_data: Dict[int, Dict[str, object]] = {}
 _debt_cache: Dict = {'mtime': None, 'rows': None, 'loaded_at': None}
 
 _debt_state: Dict = {
-    'trig_baseline': None,      # сигнатуры листа-триггера на момент последнего зачёта
-    'data_baseline': None,      # сигнатуры листа «Сверка», соответствующие активному кэшу
-    'trig_committed_on': None,  # 'YYYY-MM-DD' — когда триггеры были зачтены (пн-блокировка)
+    'trig_baseline': None,
+    'data_baseline': None,
+    'trig_rows_baseline': None,
+    'trig_committed_on': None,
+    'year_warned_for': None,
+    'year_label': None,
     'last_sigs_t': None,
     'last_sigs_d': None,
+    'last_rows_t': None,
     'last_check': None,
 }
+
+
+# ---------- АДМИНИСТРАТОРЫ ----------
+
+_dynamic_admins: Set[int] = set()
+
+
+def _load_admins():
+    global _dynamic_admins
+    try:
+        os.makedirs('data', exist_ok=True)
+        if os.path.exists(ADMINS_FILE):
+            with open(ADMINS_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            _dynamic_admins = {int(x) for x in data.get('admins', []) if str(x).lstrip('-').isdigit()}
+    except Exception as e:
+        logger.error(f"Ошибка загрузки админов: {e}")
+        _dynamic_admins = set()
+
+
+def _save_admins():
+    try:
+        os.makedirs('data', exist_ok=True)
+        with open(ADMINS_FILE, 'w', encoding='utf-8') as f:
+            json.dump({'admins': sorted(_dynamic_admins)}, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        logger.error(f"Ошибка сохранения админов: {e}")
+
+
+_load_admins()
+
+
+def is_admin(user_id: int) -> bool:
+    return user_id == ADMIN_ID or user_id in _dynamic_admins
+
+
+def is_owner(user_id: int) -> bool:
+    return user_id == ADMIN_ID
 
 
 # ---------- РАБОТА С БАЗОЙ ПОЛЬЗОВАТЕЛЕЙ ----------
@@ -227,24 +281,35 @@ def clear_user_full_name(user_id: int):
 # ---------- МЕНЮ ----------
 
 def create_main_menu(user_id: int) -> Attachment:
+    admin = is_admin(user_id)
     row1 = [
         CallbackButton(text="📋 Условия", payload="conditions", intent=Intent.DEFAULT),
         CallbackButton(text="💳 Долг", payload="debt", intent=Intent.DEFAULT)
     ]
     row2 = [
         CallbackButton(text="ℹ️ О боте", payload="info", intent=Intent.DEFAULT),
-        CallbackButton(text="💬 Поддержка", payload="support", intent=Intent.POSITIVE)
+        CallbackButton(text="❓ Справка", payload="help_command", intent=Intent.DEFAULT)
     ]
-    row3 = [CallbackButton(text="❓ Справка", payload="help_command", intent=Intent.DEFAULT)]
-    if user_id == ADMIN_ID:
-        row3.insert(0, CallbackButton(text="📢 Новости", payload="broadcast", intent=Intent.DEFAULT))
+    rows = [row1, row2]
 
-    rows = [row1, row2, row3]
-
-    if user_id == ADMIN_ID:
+    if admin:
+        row3: List[CallbackButton] = []
+        if admin:
+            row3.append(CallbackButton(text="📢 Новости", payload="broadcast", intent=Intent.DEFAULT))
+        row3.append(CallbackButton(text="👤 ID контакта", payload="userinfo", intent=Intent.DEFAULT))
+        rows.append(row3)
         rows.append([
-            CallbackButton(text="👤 Данные контакта", payload="userinfo", intent=Intent.DEFAULT)
+            CallbackButton(text="🔄 Обновить сверку", payload="refresh_debt", intent=Intent.DEFAULT),
+            CallbackButton(text="📊 Статус сверки", payload="debt_status", intent=Intent.DEFAULT)
         ])
+        if is_owner(user_id):
+            rows.append([
+                CallbackButton(text="👥 Админы", payload="adminlist", intent=Intent.DEFAULT)
+            ])
+            rows.append([
+                CallbackButton(text="➕ Админ", payload="addadmin", intent=Intent.DEFAULT),
+                CallbackButton(text="➖ Админ", payload="deladmin", intent=Intent.DEFAULT)
+            ])
 
     buttons = ButtonsPayload(buttons=rows)
     return Attachment(type="inline_keyboard", payload=buttons)
@@ -299,7 +364,6 @@ def create_cancel_menu() -> Attachment:
 # ---------- ФУНКЦИИ ДЛЯ РАБОТЫ С ДОЛГОМ ----------
 
 def parse_balance(value) -> float:
-    """Надёжный парсинг баланса: числа, '1 234,56 р.', '-500' и т.д."""
     if value is None:
         return 0.0
     if isinstance(value, (int, float)):
@@ -340,11 +404,7 @@ def clean_name(name: str) -> str:
     return name
 
 
-# FIX SHEET: нормализация имён листов — устойчивость к невидимым символам
 def _norm_sheet_name(name: str) -> str:
-    """Нормализация имени листа: неразрывные пробелы → обычные,
-    схлопывание повторных пробелов, унификация тире, lower, strip.
-    Позволяет находить лист даже при невидимых символах в названии."""
     s = str(name).replace('\xa0', ' ').replace('\u2007', ' ').replace('\u202f', ' ')
     s = re.sub(r'\s+', ' ', s).strip().lower()
     for dash in ('\u2010', '\u2011', '\u2012', '\u2013', '\u2014', '\u2212'):
@@ -356,9 +416,18 @@ def _debt_paths() -> List[str]:
     return [os.path.join(DEBT_DIR, f"sheet_{i}.xlsx") for i in range(1, len(DEBT_SHEET_IDS) + 1)]
 
 
+def _cache_fresh() -> bool:
+    paths = _debt_paths()
+    if not paths or any(not os.path.exists(p) for p in paths):
+        return False
+    try:
+        oldest = min(os.path.getmtime(p) for p in paths)
+    except OSError:
+        return False
+    return (time.time() - oldest) < DEBT_MIN_DOWNLOAD_MINUTES * 60
+
+
 def _load_debt_rows() -> Optional[List[Dict]]:
-    """Читает лист «Сверка» из каждого кэш-файла (другие листы игнорируются).
-    None — техническая ошибка (файлы отсутствуют/не читаются), [] — данные пусты."""
     if not openpyxl:
         logger.error("openpyxl не установлен")
         return None
@@ -388,8 +457,7 @@ def _load_debt_rows() -> Optional[List[Dict]]:
             rows: List[Dict] = []
             target_norm = _norm_sheet_name(DEBT_DATA_SHEET)
             for path in existing:
-                wb = openpyxl.load_workbook(path, data_only=True)
-                # FIX SHEET: ищем лист «Сверка» с нормализацией имён
+                wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
                 sheet_name = next((s for s in wb.sheetnames if _norm_sheet_name(s) == target_norm), None)
                 if sheet_name is None:
                     logger.warning(
@@ -462,8 +530,6 @@ def group_matches(matches: List[Dict]) -> Dict[str, List[Dict]]:
 
 
 def get_last_sunday() -> str:
-    # В понедельник до 13:00 МСК сверка ещё считается прошлой неделей,
-    # после 13:00 — свежей (пн–вс).
     now = datetime.now(MSK)
     today = now.date()
     if today.weekday() == 0 and now.hour < 13:
@@ -523,15 +589,7 @@ async def send_debt_result(chat_id: int, user_id: int, matches: List[Dict],
 
 # ---------- СИСТЕМА ОБНОВЛЕНИЯ СВЕРКИ ----------
 
-# Таймаут и число попыток скачивания (можно переопределить в .env)
-DOWNLOAD_TIMEOUT = int(os.getenv("DOWNLOAD_TIMEOUT", "120"))   # секунд
-DOWNLOAD_RETRIES = int(os.getenv("DOWNLOAD_RETRIES", "3"))
-
-
 def _download_debt_file_sync(url: str, tmp_path: str) -> None:
-    """Синхронное скачивание с ретраями (выполняется в отдельном потоке).
-    Google генерирует xlsx для больших таблиц с паузой до минуты-другой,
-    поэтому таймаут по умолчанию 120 с и до 3 попыток."""
     last_error: Exception = None
     for attempt in range(1, DOWNLOAD_RETRIES + 1):
         try:
@@ -547,7 +605,6 @@ def _download_debt_file_sync(url: str, tmp_path: str) -> None:
             return
 
         except urllib.error.HTTPError as e:
-            # FIX HTTP: человекочитаемая подсказка; повторять бессмысленно — сразу наверх
             if e.code in (401, 403):
                 raise ValueError(
                     f"HTTP {e.code}: таблица закрыта доступом. Откройте «Настройки доступа» → "
@@ -558,12 +615,11 @@ def _download_debt_file_sync(url: str, tmp_path: str) -> None:
             last_error = e
             logger.warning(f"Скачивание, попытка {attempt}/{DOWNLOAD_RETRIES}: HTTP {e.code}")
         except Exception as e:
-            # сетевые сбои и таймауты — повторяем
             last_error = e
             logger.warning(f"Скачивание, попытка {attempt}/{DOWNLOAD_RETRIES} не удалась: {e}")
 
         if attempt < DOWNLOAD_RETRIES:
-            time.sleep(5 * attempt)  # пауза 5с, затем 10с
+            time.sleep(5 * attempt)
 
     raise last_error
 
@@ -578,16 +634,13 @@ def _cleanup_files(paths: List[str]):
 
 
 async def _download_tables_tmp() -> Optional[List[str]]:
-    """Скачивает таблицы ПОСЛЕДОВАТЕЛЬНО во временные файлы.
-    FIX: временный файл называется sheet_N.tmp.xlsx (а не sheet_N.xlsx.tmp) —
-    openpyxl валидирует расширение и отказывается открывать '.tmp'.
-    None — если хотя бы одна не скачалась (кэш при этом не трогаем)."""
     tmps = [p.replace(".xlsx", ".tmp.xlsx") for p in _debt_paths()]
     os.makedirs(DEBT_DIR, exist_ok=True)
 
     try:
         for sid, path in zip(DEBT_SHEET_IDS, tmps):
-            url = f"https://docs.google.com/spreadsheets/d/{sid}/export?format=xlsx"
+            url = (f"https://docs.google.com/spreadsheets/d/{sid}/export?format=xlsx"
+                   f"&nocache={int(time.time() * 1000)}")
             await asyncio.to_thread(_download_debt_file_sync, url, path)
             logger.info(f"Таблица {sid[:10]}… скачана")
         return tmps
@@ -598,10 +651,7 @@ async def _download_tables_tmp() -> Optional[List[str]]:
 
 
 def _sheet_signature(path: str, sheet_name: str) -> Optional[str]:
-    """md5-отпечаток листа. OPT: для листа-триггера (гигантский «Выгрузка продаж»)
-    хешируем число строк + первые 50 + последние 10 строк — он обновляется
-    дополнением строк, и это детектируется надёжно. Полное хеширование —
-    только для компактного листа «Сверка». None — лист не найден/файл битый."""
+    """md5-отпечаток содержимого листа. Хешируется лист ПОЛНОСТЬЮ."""
     if not openpyxl:
         return None
 
@@ -625,46 +675,173 @@ def _sheet_signature(path: str, sheet_name: str) -> Optional[str]:
             )
             return None
 
-        # Лист-триггер огромен — облегчённый режим
-        light = (_norm_sheet_name(sheet_name) == _norm_sheet_name(DEBT_SOURCE_SHEET))
-
         h = hashlib.md5()
-        if light:
-            rows_read = 0
-            head: List[str] = []
-            tail: List[str] = []
-            for row in wb[name].iter_rows(values_only=True):
-                rows_read += 1
-                if rows_read <= 50:
-                    head.append(repr(row))
-                if rows_read > 10:
-                    tail.pop(0)
-                tail.append(repr(row))
-            h.update(f"rows={rows_read}".encode('utf-8'))
-            for r in head:
-                h.update(r.encode('utf-8'))
-            for r in tail:
-                h.update(r.encode('utf-8'))
-        else:
-            for row in wb[name].iter_rows(values_only=True):
-                h.update(repr(row).encode('utf-8'))
+        for row in wb[name].iter_rows(values_only=True):
+            h.update(repr(row).encode('utf-8'))
         return h.hexdigest()
     finally:
         wb.close()
 
 
+def _column_signature(path: str, sheet_name: str) -> Optional[str]:
+    """md5-отпечаток столбца «Количество» листа-триггера.
+    Заголовок ищется в первых 5 строках листа; хешируются только НЕПУСТЫЕ
+    значения столбца ниже заголовка, плюс их количество. Пустые строки-хвост
+    и изменения в других столбцах отпечаток НЕ меняют.
+    None — лист или столбец не найден."""
+    if not openpyxl:
+        return None
+
+    try:
+        wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
+    except Exception as e:
+        logger.warning(f"openpyxl (read_only) не смог открыть {os.path.basename(path)}: {e}")
+        return None
+
+    try:
+        target = _norm_sheet_name(sheet_name)
+        nm = next((s for s in wb.sheetnames if _norm_sheet_name(s) == target), None)
+        if nm is None:
+            logger.warning(
+                f"Лист «{sheet_name}» не найден в {os.path.basename(path)}. "
+                f"Реальные имена листов: {[repr(s) for s in wb.sheetnames]}"
+            )
+            return None
+
+        header_norm = _norm_word(TRIG_COLUMN_HEADER)
+        target_col = None
+        scan_rows = 0
+        values: List[str] = []
+
+        for row in wb[nm].iter_rows(values_only=True):
+            scan_rows += 1
+
+            # Пока не найден заголовок — ищем его (первые 5 строк листа)
+            if target_col is None:
+                for ci, v in enumerate(row, start=1):
+                    if v is None:
+                        continue
+                    nv = _norm_word(str(v)).strip()
+                    if nv in _TRIG_COLUMN_ALIASES:
+                        target_col = ci
+                        break
+                if target_col is None and scan_rows >= 5:
+                    logger.warning(
+                        f"Столбец «{TRIG_COLUMN_HEADER}» не найден в первых 5 строках "
+                        f"листа «{sheet_name}» ({os.path.basename(path)})")
+                    return None
+                continue
+
+            # Заголовок найден — собираем значения столбца
+            v = row[target_col - 1] if len(row) >= target_col else None
+            if v is not None and str(v).strip() != '':
+                values.append(repr(v))
+
+        if target_col is None:
+            logger.warning(f"Столбец «{TRIG_COLUMN_HEADER}» не найден в листе «{sheet_name}»")
+            return None
+
+        h = hashlib.md5()
+        for v in values:
+            h.update(v.encode('utf-8'))
+        h.update(f"n={len(values)}".encode('utf-8'))
+        return h.hexdigest()
+    finally:
+        wb.close()
+
+
+def _trig_signatures(tmps: List[str]) -> List[Optional[str]]:
+    """Сигнатуры столбца «Количество» листа-триггера для каждой таблицы."""
+    return [_column_signature(t, DEBT_SOURCE_SHEET) for t in tmps]
+    
+
 def _signatures(tmps: List[str], sheet_name: str) -> List[Optional[str]]:
     return [_sheet_signature(t, sheet_name) for t in tmps]
 
 
+def _rows_counts(paths: List[str], sheet_name: str) -> List[Optional[int]]:
+    """Число НЕПУСТЫХ строк листа в каждом файле (глубокая проверка триггеров)."""
+    out: List[Optional[int]] = []
+    for p in paths:
+        try:
+            wb2 = openpyxl.load_workbook(p, data_only=True, read_only=True)
+        except Exception:
+            out.append(None)
+            continue
+        try:
+            target2 = _norm_sheet_name(sheet_name)
+            nm = next((s for s in wb2.sheetnames if _norm_sheet_name(s) == target2), None)
+            if nm is None:
+                out.append(None)
+                continue
+            cnt = 0
+            for row in wb2[nm].iter_rows(values_only=True):
+                if any(v is not None and str(v).strip() != '' for v in row):
+                    cnt += 1
+            out.append(cnt)
+        finally:
+            wb2.close()
+    return out
+
+
+def _parse_cell_addr(addr: str) -> Optional[tuple]:
+    """Разбирает адрес ячейки 'A2' -> (строка=2, столбец=1). None — не удалось."""
+    m = re.match(r'^([A-Za-z]+)(\d+)$', addr.strip())
+    if not m:
+        return None
+    col = 0
+    for ch in m.group(1).upper():
+        col = col * 26 + (ord(ch) - ord('A') + 1)
+    return (int(m.group(2)), col)
+
+
+def _read_year_cell(path: str, cell_spec: str) -> Optional[str]:
+    """YEAR: читает ячейку-метку года. cell_spec = 'Лист!A2' — читается
+    именно указанная ячейка. Числовые значения приводятся к целому виду
+    (2026.0 -> '2026'). None — не удалось прочитать."""
+    try:
+        sheet_name, addr = cell_spec.split("!", 1)
+    except ValueError:
+        return None
+
+    rc = _parse_cell_addr(addr)
+    if rc is None:
+        logger.warning(f"Не удалось разобрать адрес ячейки: {cell_spec!r}")
+        return None
+    target_row, target_col = rc
+
+    try:
+        wb = openpyxl.load_workbook(path, data_only=True, read_only=True)
+    except Exception:
+        return None
+    try:
+        nm = next((s for s in wb.sheetnames if _norm_sheet_name(s) == _norm_sheet_name(sheet_name)), None)
+        if nm is None:
+            return None
+        val = None
+        r_idx = 0
+        for row in wb[nm].iter_rows(min_row=1, max_row=target_row,
+                                    min_col=target_col, max_col=target_col,
+                                    values_only=True):
+            r_idx += 1
+            if r_idx == target_row:
+                val = row[0] if row else None
+        if val is None:
+            return ""
+        # Число из Excel часто приходит как float (2026.0) — приводим к '2026'
+        if isinstance(val, float) and val.is_integer():
+            return str(int(val))
+        return str(val).strip()
+    finally:
+        wb.close()
+
+
 def _commit_tables(tmps: List[str]):
-    """Атомарно подменяет кэш-файлы сверки (парой)."""
     for tmp, path in zip(tmps, _debt_paths()):
         os.replace(tmp, path)
     logger.info("Кэш сверки обновлён")
 
 
-# Персистентность состояния
 def _load_debt_state():
     try:
         if os.path.exists(DEBT_STATE_FILE):
@@ -677,9 +854,18 @@ def _load_debt_state():
                 _debt_state['trig_baseline'] = tb
             if isinstance(db, list) and len(db) == n:
                 _debt_state['data_baseline'] = db
+            trb = data.get('trig_rows_baseline')
+            if isinstance(trb, list) and len(trb) == n:
+                _debt_state['trig_rows_baseline'] = trb
             tco = data.get('trig_committed_on')
             if isinstance(tco, str):
                 _debt_state['trig_committed_on'] = tco
+            yw = data.get('year_warned_for')
+            if isinstance(yw, str):
+                _debt_state['year_warned_for'] = yw
+            yl = data.get('year_label')
+            if isinstance(yl, str):
+                _debt_state['year_label'] = yl
     except Exception as e:
         logger.warning(f"Не удалось прочитать состояние сверки: {e}")
 
@@ -691,14 +877,16 @@ def _save_debt_state():
             json.dump({
                 'trig_baseline': _debt_state['trig_baseline'],
                 'data_baseline': _debt_state['data_baseline'],
+                'trig_rows_baseline': _debt_state.get('trig_rows_baseline'),
                 'trig_committed_on': _debt_state['trig_committed_on'],
+                'year_warned_for': _debt_state.get('year_warned_for'),
+                'year_label': _debt_state.get('year_label'),
             }, f, ensure_ascii=False)
     except Exception as e:
         logger.error(f"Не удалось сохранить состояние сверки: {e}")
 
 
 async def notify_debt_updated():
-    """Рассылает сообщение об обновлении сверки ВСЕМ пользователям из базы."""
     text = "Сверка обновлена. Можно проверить наличие актуальной задолженности."
     users = load_users()
     sent = 0
@@ -717,21 +905,30 @@ async def notify_debt_updated():
     logger.info(f"Уведомление об обновлении сверки: отправлено {sent}, ошибок {errors}")
 
 
+def _rows_gain_text(st: Dict, cur_rows: List[Optional[int]]) -> Optional[str]:
+    base_rows = st.get('trig_rows_baseline')
+    if not base_rows or len(base_rows) != len(cur_rows):
+        return None
+    gains = []
+    for i in range(len(cur_rows)):
+        if cur_rows[i] is not None and base_rows[i] is not None and cur_rows[i] != base_rows[i]:
+            gains.append(f"табл.{i+1}: {cur_rows[i]} (было {base_rows[i]})")
+    if not gains:
+        return None
+    return "📈 Выгрузки: " + "; ".join(gains)
+
+
 # ---------- АВТОВОССТАНОВЛЕНИЕ КЭША ПРИ ЗАПРОСЕ ДОЛГА ----------
 
 _debt_recover_lock: Optional[asyncio.Lock] = None
 
 
 async def ensure_debt_cache() -> bool:
-    """Восстанавливает кэш сверки скачиванием, если файлы отсутствуют
-    или не читаются. True — после вызова данные доступны.
-    Блокировка защищает от параллельных скачиваний при одновременных запросах."""
     global _debt_recover_lock
     if _debt_recover_lock is None:
         _debt_recover_lock = asyncio.Lock()
 
     async with _debt_recover_lock:
-        # Повторная проверка: пока ждали блокировку, другой запрос мог уже всё восстановить
         if _load_debt_rows() is not None:
             return True
 
@@ -741,21 +938,20 @@ async def ensure_debt_cache() -> bool:
             logger.error("Восстановить кэш сверки не удалось (таблицы не скачались)")
             return False
 
-        trig_sigs = await asyncio.to_thread(_signatures, tmps, DEBT_SOURCE_SHEET)
+        trig_sigs = await asyncio.to_thread(_trig_signatures, tmps)
         data_sigs = await asyncio.to_thread(_signatures, tmps, DEBT_DATA_SHEET)
 
         _commit_tables(tmps)
 
-        # Синхронизируем базовые сигнатуры: активный кэш теперь равен текущему
-        # состоянию Google. Если состояния ещё нет вовсе — фиксируем как базовое,
-        # чтобы первый же плановый чек не сгенерировал лишнее уведомление.
         if all(s is not None for s in data_sigs):
             _debt_state['data_baseline'] = data_sigs[:]
             if _debt_state['trig_baseline'] is None and all(s is not None for s in trig_sigs):
                 _debt_state['trig_baseline'] = trig_sigs[:]
+                _debt_state['trig_rows_baseline'] = await asyncio.to_thread(
+                    _rows_counts, tmps, DEBT_SOURCE_SHEET)
         _save_debt_state()
 
-        _load_debt_rows()  # прогреть кэш прочитанных строк
+        _load_debt_rows()
         logger.info("Кэш сверки восстановлен по запросу")
         return True
 
@@ -771,62 +967,91 @@ async def search_debt_with_recovery(full_name: str) -> Optional[List[Dict]]:
 # ---------- ПЛАНОВЫЕ ПРОВЕРКИ ----------
 
 async def startup_check() -> str:
-    """Проверка при старте бота. Восстанавливает состояние из файла;
-    если триггеры обновились, пока бот был выключен — зачитывает с рассылкой;
-    если менялся только лист «Сверка» — тихо обновляет кэш."""
+    """Проверка при старте бота. Триггер = изменение столбца «Количество»
+    в ОБОИХ таблицах, зачёт с рассылкой — только в понедельник; вне понедельника
+    расхождение baseline — тихая синхронизация. Меняется только «Сверка» — тихо."""
     _load_debt_state()
+    st = _debt_state
+    if _cache_fresh() and st['trig_baseline'] and st['data_baseline']:
+        return (f"✅ Кэш сверки свежий (< {DEBT_MIN_DOWNLOAD_MINUTES} мин) — "
+                "стартовое скачивание пропущено.")
+
     n = len(DEBT_SHEET_IDS)
 
     tmps = await _download_tables_tmp()
     if tmps is None:
         return "❌ Не удалось скачать одну из таблиц (см. лог)."
 
-    trig_sigs = await asyncio.to_thread(_signatures, tmps, DEBT_SOURCE_SHEET)
-    data_sigs = await asyncio.to_thread(_signatures, tmps, DEBT_DATA_SHEET)
-    if any(s is None for s in trig_sigs) or any(s is None for s in data_sigs):
+    trig_sigs = await asyncio.to_thread(_trig_signatures, tmps)
+    if any(s is None for s in trig_sigs):
         _cleanup_files(tmps)
-        return (f"⚠️ Не найден лист «{DEBT_SOURCE_SHEET}» или «{DEBT_DATA_SHEET}». "
-                "Точные имена листов см. в предупреждениях выше в логе. "
-                "Проверьте DEBT_DATA_SHEET / DEBT_SOURCE_SHEET в настройках.")
+        return (f"⚠️ Не найден столбец «{TRIG_COLUMN_HEADER}» в листе "
+                f"«{DEBT_SOURCE_SHEET}» (подробности в логе).")
+
+    data_sigs = await asyncio.to_thread(_signatures, tmps, DEBT_DATA_SHEET)
+    if any(s is None for s in data_sigs):
+        _cleanup_files(tmps)
+        return (f"⚠️ Не найден лист «{DEBT_DATA_SHEET}». "
+                "Точные имена листов см. в предупреждениях выше в логе.")
+
+    cur_rows = await asyncio.to_thread(_rows_counts, tmps, DEBT_SOURCE_SHEET)
+    year_label = await asyncio.to_thread(_read_year_cell, tmps[0], DEBT_YEAR_CELL)
 
     st = _debt_state
     st['last_sigs_t'] = trig_sigs
     st['last_sigs_d'] = data_sigs
+    st['last_rows_t'] = cur_rows[:]
+    st['year_label'] = year_label
     st['last_check'] = datetime.now(MSK)
 
-    # Первый запуск вообще (нет состояния) — фиксируем как базовое, без уведомлений
     if st['trig_baseline'] is None or st['data_baseline'] is None:
         _commit_tables(tmps)
         st['trig_baseline'] = trig_sigs[:]
         st['data_baseline'] = data_sigs[:]
+        st['trig_rows_baseline'] = cur_rows[:]
         _save_debt_state()
         rows = _load_debt_rows()
         count = len(rows) if rows is not None else "?"
         return f"✅ Сверка загружена ({count} записей). Базовое состояние зафиксировано."
 
-    today = datetime.now(MSK).date().isoformat()
+    now = datetime.now(MSK)
+    today = now.date().isoformat()
+    today_wd = now.weekday()
 
-    # Триггеры обновились, пока бот был выключен → зачёт с рассылкой (один раз)
-    if all(trig_sigs[i] != st['trig_baseline'][i] for i in range(n)):
+    trig_fingerprint_changed = any(trig_sigs[i] != st['trig_baseline'][i] for i in range(n))
+
+    # Зачёт обновления за время простоя — ТОЛЬКО в понедельник
+    if trig_fingerprint_changed and today_wd == 0:
         _commit_tables(tmps)
         st['trig_baseline'] = trig_sigs[:]
         st['data_baseline'] = data_sigs[:]
+        st['trig_rows_baseline'] = cur_rows[:]
         st['trig_committed_on'] = today
         _save_debt_state()
         rows = _load_debt_rows()
         count = len(rows) if rows is not None else "?"
         await notify_debt_updated()
-        return (f"✅ За время отключения таблицы обновились. Сверка актуальна "
-                f"({count} записей), уведомление отправлено пользователям.")
+        gain = _rows_gain_text(st, cur_rows) or ""
+        return (f"✅ За время отключения столбец «{TRIG_COLUMN_HEADER}» обновился в обеих "
+                f"таблицах. Сверка актуальна ({count} записей), уведомление отправлено. {gain}")
 
-    # Только сверка изменилась → тихая подмена
+    # Вне понедельника расхождение триггеров — тихая синхронизация
+    if trig_fingerprint_changed:
+        st['trig_baseline'] = trig_sigs[:]
+        st['trig_rows_baseline'] = cur_rows[:]
+        _save_debt_state()
+        logger.info("Триггеры: baseline синхронизирован вне понедельника (без рассылки)")
+
     if any(data_sigs[i] != st['data_baseline'][i] for i in range(n)):
         _commit_tables(tmps)
         st['data_baseline'] = data_sigs[:]
         _save_debt_state()
         rows = _load_debt_rows()
         count = len(rows) if rows is not None else "?"
-        return f"🔄 Лист «{DEBT_DATA_SHEET}» обновился — сверка актуализирована ({count} записей)."
+        gain = _rows_gain_text(st, cur_rows)
+        extra = f" {gain}" if gain else ""
+        return (f"🔄 Лист «{DEBT_DATA_SHEET}» обновился — сверка актуализирована "
+                f"({count} записей), без рассылки.{extra}")
 
     _cleanup_files(tmps)
     rows = _load_debt_rows()
@@ -837,21 +1062,32 @@ async def startup_check() -> str:
 async def scheduled_check(force_weekday: bool = False) -> str:
     """Плановая проверка.
     1) Триггеры: только в понедельник (или force_weekday для ручного /refresh_debt)
-       и только если ещё не зачтены сегодня. Оба изменились → зачёт + рассылка.
+       и только если ещё не зачтены сегодня. Триггер = изменение данных в столбце
+       «Количество» листа «Выгрузка продаж 5-ка» в ОБОИХ таблицах → зачёт + рассылка.
     2) Сверка: пн–пт; изменилась → тихая подмена кэша."""
     n = len(DEBT_SHEET_IDS)
+    if not force_weekday and _cache_fresh():
+        return "— Кэш сверки свежий, скачивание пропущено."
 
     tmps = await _download_tables_tmp()
     if tmps is None:
         return "❌ Не удалось скачать одну из таблиц (см. лог). Пробую при следующей проверке."
 
-    trig_sigs = await asyncio.to_thread(_signatures, tmps, DEBT_SOURCE_SHEET)
-    data_sigs = await asyncio.to_thread(_signatures, tmps, DEBT_DATA_SHEET)
-    if any(s is None for s in trig_sigs) or any(s is None for s in data_sigs):
+    # Триггер: отпечатки столбца «Количество»
+    trig_sigs = await asyncio.to_thread(_trig_signatures, tmps)
+    if any(s is None for s in trig_sigs):
         _cleanup_files(tmps)
-        return (f"⚠️ Не найден лист «{DEBT_SOURCE_SHEET}» или «{DEBT_DATA_SHEET}». "
-                "Точные имена листов см. в предупреждениях выше в логе. "
-                "Проверьте DEBT_DATA_SHEET / DEBT_SOURCE_SHEET в настройках.")
+        return (f"⚠️ Не найден столбец «{TRIG_COLUMN_HEADER}» в листе "
+                f"«{DEBT_SOURCE_SHEET}» (подробности в логе). Зачёт не выполнялся.")
+
+    data_sigs = await asyncio.to_thread(_signatures, tmps, DEBT_DATA_SHEET)
+    if any(s is None for s in data_sigs):
+        _cleanup_files(tmps)
+        return (f"⚠️ Не найден лист «{DEBT_DATA_SHEET}». "
+                "Точные имена листов см. в предупреждениях выше в логе.")
+
+    cur_rows = await asyncio.to_thread(_rows_counts, tmps, DEBT_SOURCE_SHEET)
+    year_label = await asyncio.to_thread(_read_year_cell, tmps[0], DEBT_YEAR_CELL)
 
     now = datetime.now(MSK)
     today = now.date().isoformat()
@@ -860,6 +1096,8 @@ async def scheduled_check(force_weekday: bool = False) -> str:
     st = _debt_state
     st['last_sigs_t'] = trig_sigs
     st['last_sigs_d'] = data_sigs
+    st['last_rows_t'] = cur_rows[:]
+    st['year_label'] = year_label
     st['last_check'] = now
 
     lines: List[str] = []
@@ -868,35 +1106,46 @@ async def scheduled_check(force_weekday: bool = False) -> str:
     # ---------- 1. Триггерная проверка (пн, до зачёта) ----------
     if (wd == 0 or force_weekday) and st['trig_committed_on'] != today:
         if st['trig_baseline'] is None or len(st['trig_baseline']) != n:
+            # Первая проверка — фиксируем базовые отпечатки столбца
             st['trig_baseline'] = trig_sigs[:]
+            st['trig_rows_baseline'] = cur_rows[:]
         elif all(trig_sigs[i] != st['trig_baseline'][i] for i in range(n)):
-            # ОБА триггера обновились — зачёт
+            # Столбец «Количество» изменился в ОБОИХ таблицах — недельный зачёт
             _commit_tables(tmps)
             st['trig_baseline'] = trig_sigs[:]
             st['data_baseline'] = data_sigs[:]
+            st['trig_rows_baseline'] = cur_rows[:]
             st['trig_committed_on'] = today
             trig_done = True
             rows = _load_debt_rows()
             count = len(rows) if rows is not None else "?"
             logger.info(f"Недельное обновление сверки зачтено ({count} записей)")
             await notify_debt_updated()
-            lines.append(f"✅ Сверка обновлена и разослана всем пользователям ({count} записей).")
+            gain = _rows_gain_text(st, cur_rows) or ""
+            lines.append(f"✅ Сверка обновлена и разослана всем пользователям ({count} записей). {gain}")
         else:
             changed = [i + 1 for i in range(n) if trig_sigs[i] != st['trig_baseline'][i]]
             waiting = [i + 1 for i in range(n) if trig_sigs[i] == st['trig_baseline'][i]]
             if changed:
-                lines.append(f"⏳ Триггер(ы) обновились в таблице {changed}; жду таблицу {waiting}. "
-                             "Рассылка будет после обновления всех таблиц.")
+                lines.append(f"⏳ Столбец «{TRIG_COLUMN_HEADER}» изменился в таблице {changed}; "
+                             f"жду таблицу {waiting}. Рассылка будет после обновления обеих таблиц.")
 
     # ---------- 2. Сверка-проверка (пн–пт, тихо) ----------
     if not trig_done:
         if wd in (5, 6) and not force_weekday:
-            _cleanup_files(tmps)  # в выходные плановых сверок не делаем
+            if any(not os.path.exists(p) for p in _debt_paths()):
+                _commit_tables(tmps)
+                rows = _load_debt_rows()
+                count = len(rows) if rows is not None else "?"
+                lines.append(f"♻️ Кэш-файлы отсутствовали — восстановлены ({count} записей).")
+            else:
+                _cleanup_files(tmps)
         elif st['data_baseline'] is None or len(st['data_baseline']) != n:
             _commit_tables(tmps)
             st['data_baseline'] = data_sigs[:]
             if st['trig_baseline'] is None:
                 st['trig_baseline'] = trig_sigs[:]
+                st['trig_rows_baseline'] = cur_rows[:]
             rows = _load_debt_rows()
             count = len(rows) if rows is not None else "?"
             lines.append(f"🔄 Лист «{DEBT_DATA_SHEET}» зафиксирован ({count} записей).")
@@ -906,23 +1155,26 @@ async def scheduled_check(force_weekday: bool = False) -> str:
             st['data_baseline'] = data_sigs[:]
             rows = _load_debt_rows()
             count = len(rows) if rows is not None else "?"
+            gain = _rows_gain_text(st, cur_rows)
+            extra = f" {gain}" if gain else ""
             lines.append(f"🔄 Лист «{DEBT_DATA_SHEET}» изменился в таблице(ах) {changed} — "
-                         f"активная сверка обновлена ({count} записей), без рассылки.")
+                         f"активная сверка обновлена ({count} записей), без рассылки.{extra}")
         else:
-            _cleanup_files(tmps)
-            if not lines:
-                lines.append("— Изменений в таблицах нет.")
+            if any(not os.path.exists(p) for p in _debt_paths()):
+                _commit_tables(tmps)
+                rows = _load_debt_rows()
+                count = len(rows) if rows is not None else "?"
+                lines.append(f"♻️ Кэш-файлы отсутствовали — восстановлены ({count} записей).")
+            else:
+                _cleanup_files(tmps)
+                if not lines:
+                    lines.append("— Изменений в таблицах нет.")
 
     _save_debt_state()
     return "\n".join(lines) if lines else "— Изменений нет."
 
 
 async def debt_refresh_loop():
-    """Расписание фоновых проверок (московское время):
-    • стартовая проверка — всегда при запуске;
-    • пн: каждые DEBT_CHECK_MONDAY_MINUTES (триггеры до зачёта + сверка);
-    • вт–пт: каждые DEBT_CHECK_WEEKDAY_MINUTES (только сверка);
-    • сб–вс: плановых проверок нет."""
     if not DEBT_SHEET_IDS:
         logger.warning("DEBT_SHEET_IDS не задан — обновление сверки отключено")
         return
@@ -936,6 +1188,36 @@ async def debt_refresh_loop():
     while True:
         now = datetime.now(MSK)
         wd = now.weekday()
+
+        # YEAR: недельная проверка метки года
+        if (wd == DEBT_YEAR_CHECK_WD and now.hour >= DEBT_YEAR_CHECK_HOUR
+                and DEBT_SHEET_IDS):
+            try:
+                paths = _debt_paths()
+                if any(os.path.exists(p) for p in paths):
+                    year_val = await asyncio.to_thread(
+                        _read_year_cell, paths[0], DEBT_YEAR_CELL)
+                    _debt_state['year_label'] = year_val
+                    _save_debt_state()
+                    cur_year = str(now.year)
+                    if year_val is None or cur_year not in (year_val or ""):
+                        if _debt_state.get('year_warned_for') != cur_year:
+                            _debt_state['year_warned_for'] = cur_year
+                            _save_debt_state()
+                            users = load_users()
+                            a = users.get(str(ADMIN_ID))
+                            if a and a.get('chat_id'):
+                                await bot.send_message(
+                                    chat_id=a['chat_id'],
+                                    text=("⚠️ **Проверьте ссылку на таблицы сверки!**\n\n"
+                                          f"Метка года в {DEBT_YEAR_CELL}: "
+                                          f"«{year_val if year_val else '—'}», ожидается {cur_year}.\n\n"
+                                          "Если наступил новый год — обновите DEBT_SHEET_IDS в .env "
+                                          "и перезапустите бота. До этого сверка берётся из прежних таблиц."),
+                                    format="markdown")
+                            logger.warning(f"Метка года сверки неактуальна: {year_val!r}")
+            except Exception as e:
+                logger.error(f"Ошибка проверки метки года: {e}")
 
         if wd in (5, 6):
             await asyncio.sleep(3600)
@@ -981,7 +1263,7 @@ def format_forwarded_user_info(sender) -> str:
 
     return (
         "👤 **Данные контакта:**\n\n"
-        f"• **User ID:** `{fw_user_id if fw_user_id else '—'}\n"
+        f"• **User ID:** `{fw_user_id if fw_user_id else '—'}`\n"
         f"• **Chat ID:** `{fw_chat_id if fw_chat_id else '—'}`\n"
         f"• **Имя:** {fio}\n"
     )
@@ -1057,33 +1339,58 @@ async def cmd_start(event: MessageCreated):
     )
 
 
+# MENU: всегда доступное меню по /menu (синоним /start без приветствия)
+@dp.message_created(Command('menu'))
+async def cmd_menu(event: MessageCreated):
+    user = event.message.sender
+    user_id = user.user_id
+    chat_id = event.message.recipient.chat_id
+    ensure_user(user_id, chat_id, getattr(user, 'username', None), getattr(user, 'first_name', None))
+    user_states.pop(user_id, None)
+    user_clarify_data.pop(user_id, None)
+    admin_debt_data.pop(user_id, None)
+    await bot.send_message(
+        chat_id=chat_id,
+        text="🏠 Главное меню:",
+        attachments=[create_main_menu(user_id)]
+    )
+
+
 async def send_help(chat_id: int, user_id: int):
+    admin = is_admin(user_id)
     text = "📋 **Справка**\n\n"
-    text += "Используйте кнопки под сообщениями:\n"
+    text += "Кнопки меню доступны всегда — отправьте /menu или /start.\n\n"
+    text += "Кнопки:\n"
     text += "• 📋 Условия – условия по регионам\n"
-    if user_id == ADMIN_ID:
+    if admin:
         text += "• 💳 Долг – проверить задолженность по любому ФИО\n"
     else:
         text += "• 💳 Долг – проверить задолженность\n"
     text += "• ℹ️ О боте – информация о боте\n"
-    text += "• 💬 Поддержка – связаться с администратором\n"
-    text += "• ❓ Справка – эта справка\n"
-    if user_id == ADMIN_ID:
+    if admin:
         text += "• 📢 Новости – сделать рассылку (только для админа)\n"
-        text += "• 👤 Данные контакта – получить данные пользователя (только для админа)\n"
+        text += "• 👤 ID контакта – получить данные пользователя (только для админа)\n"
+        text += "• 🔄 Обновить сверку / 📊 Статус сверки – кнопки (только для админа)\n"
+    if is_owner(user_id):
+        text += "• 👥 Админы – список админов (владелец)\n"
+        text += "• ➕/➖ Админы – назначить/снять админа (владелец)\n"
 
     text += "\n**Доступные команды:**\n"
+    text += "• /menu — Главное меню (кнопки всегда под рукой)\n"
     text += "• /start — Главное меню\n"
     text += "• /help — Эта справка\n"
     text += "• /debt — Узнать долг\n"
     text += "• /change_name — Сменить ФИО\n"
     text += "• /cancel — Отменить текущее действие\n"
-    if user_id == ADMIN_ID:
+    if admin:
         text += "• /broadcast — Начать рассылку (только админ)\n"
-        text += "• /reply — Ответить пользователю (только админ)\n"
-        text += "• /userinfo — Данные контакта (только админ)\n"
+        text += "• /userinfo — ID контакта (только админ)\n"
         text += "• /refresh_debt — Проверить таблицы сверки сейчас (только админ)\n"
         text += "• /debt_status — Статус сверки (только админ)\n"
+        text += "• /adminlist — Список админов\n"
+    if is_owner(user_id):
+        text += "• /addadmin <id> — Назначить админа (владелец)\n"
+        text += "• /deladmin <id> — Снять админа (владелец)\n"
 
     await bot.send_message(
         chat_id=chat_id,
@@ -1154,7 +1461,7 @@ async def callback_debt(event: MessageCallback):
 async def handle_debt_request(user_id: int, chat_id: int, event):
     ensure_user(user_id, chat_id, None, None)
 
-    if user_id == ADMIN_ID:
+    if is_admin(user_id):
         user_states[user_id] = UserState.ADMIN_DEBT_MODE
         user_clarify_data.pop(user_id, None)
         admin_debt_data.pop(user_id, None)
@@ -1194,7 +1501,6 @@ async def handle_debt_request(user_id: int, chat_id: int, event):
 
 
 async def process_debt_search(user_id: int, chat_id: int, full_name: str):
-    # Поиск с автовосстановлением (скачивает таблицы, если кэша нет)
     matches = await search_debt_with_recovery(full_name)
 
     if matches is None:
@@ -1246,7 +1552,6 @@ async def process_debt_search(user_id: int, chat_id: int, full_name: str):
 
 
 async def process_admin_debt_search(user_id: int, chat_id: int, full_name: str):
-    # Поиск с автовосстановлением
     matches = await search_debt_with_recovery(full_name)
 
     if matches is None:
@@ -1305,7 +1610,7 @@ async def callback_admin_debt_again(event: MessageCallback):
     user_id = user.user_id
     chat_id = event.message.recipient.chat_id
 
-    if user_id != ADMIN_ID:
+    if not is_admin(user_id):
         await event.answer(notification="⛔ Доступно только администратору")
         return
 
@@ -1321,7 +1626,7 @@ async def cmd_userinfo(event: MessageCreated):
     chat_id = event.message.recipient.chat_id
     ensure_user(user_id, chat_id, getattr(user, 'username', None), getattr(user, 'first_name', None))
 
-    if user_id != ADMIN_ID:
+    if not is_admin(user_id):
         await event.message.answer("⛔ Эта команда доступна только администратору.")
         return
 
@@ -1343,7 +1648,7 @@ async def callback_userinfo(event: MessageCallback):
     chat_id = event.message.recipient.chat_id
     ensure_user(user_id, chat_id, getattr(user, 'username', None), getattr(user, 'first_name', None))
 
-    if user_id != ADMIN_ID:
+    if not is_admin(user_id):
         await event.answer(notification="⛔ Доступно только администратору")
         await bot.send_message(
             chat_id=chat_id,
@@ -1365,41 +1670,178 @@ async def callback_userinfo(event: MessageCallback):
     )
 
 
+# ---------- УПРАВЛЕНИЕ АДМИНАМИ ----------
+
+@dp.message_created(Command('addadmin'))
+async def cmd_addadmin(event: MessageCreated):
+    user_id = event.message.sender.user_id
+    chat_id = event.message.recipient.chat_id
+
+    if not is_owner(user_id):
+        await event.message.answer("⛔ Управлять админами может только владелец бота.")
+        return
+
+    body = getattr(event.message, 'body', None)
+    text = (getattr(body, 'text', None) or '') if body else ''
+    m = re.match(r'^/addadmin\s+(\d+)\s*$', text.strip())
+    if not m:
+        user_states[user_id] = UserState.WAITING_ADDADMIN_ID
+        await event.message.answer(
+            "➕ **Назначение админа**\n\n"
+            "Отправьте user_id пользователя (только число).\n"
+            "Он должен хотя бы раз писать боту.\n"
+            "Для отмены — /cancel.",
+            format="markdown",
+            attachments=[create_cancel_menu()])
+        return
+
+    new_id = int(m.group(1))
+    if new_id == ADMIN_ID:
+        await event.message.answer("ℹ️ Владелец уже является администратором.")
+        return
+    if new_id in _dynamic_admins:
+        await event.message.answer(f"ℹ️ Пользователь {new_id} уже администратор.")
+        return
+
+    if str(new_id) not in load_users():
+        await event.message.answer(
+            f"⚠️ Пользователь {new_id} не найден в базе.\n"
+            "Он должен хотя бы раз написать боту (/start), прежде чем его можно будет назначить.")
+        return
+
+    _dynamic_admins.add(new_id)
+    _save_admins()
+    logger.info(f"Владелец назначил админа: {new_id}")
+    await event.message.answer(f"✅ Пользователь `{new_id}` назначен администратором.", format="markdown")
+    try:
+        await bot.send_message(chat_id=new_id, text="🎉 Вам выданы права администратора бота.")
+    except Exception:
+        pass
+
+
+@dp.message_created(Command('deladmin'))
+async def cmd_deladmin(event: MessageCreated):
+    user_id = event.message.sender.user_id
+    chat_id = event.message.recipient.chat_id
+
+    if not is_owner(user_id):
+        await event.message.answer("⛔ Управлять админами может только владелец бота.")
+        return
+
+    body = getattr(event.message, 'body', None)
+    text = (getattr(body, 'text', None) or '') if body else ''
+    m = re.match(r'^/deladmin\s+(\d+)\s*$', text.strip())
+    if not m:
+        user_states[user_id] = UserState.WAITING_DELADMIN_ID
+        await event.message.answer(
+            "➖ **Снятие админа**\n\n"
+            "Отправьте user_id администратора (только число).\n"
+            "Для отмены — /cancel.",
+            format="markdown",
+            attachments=[create_cancel_menu()])
+        return
+
+    del_id = int(m.group(1))
+    if del_id == ADMIN_ID:
+        await event.message.answer("⛔ Нельзя снять самого владельца.")
+        return
+    if del_id not in _dynamic_admins:
+        await event.message.answer(f"ℹ️ Пользователь {del_id} не является динамическим админом.")
+        return
+
+    _dynamic_admins.discard(del_id)
+    _save_admins()
+    logger.info(f"Владелец снял админа: {del_id}")
+    await event.message.answer(f"✅ Права администратора сняты с `{del_id}`.", format="markdown")
+    try:
+        await bot.send_message(chat_id=del_id, text="ℹ️ Права администратора бота отозваны.")
+    except Exception:
+        pass
+
+
+@dp.message_created(Command('adminlist'))
+async def cmd_adminlist(event: MessageCreated):
+    user_id = event.message.sender.user_id
+
+    if not is_admin(user_id):
+        await event.message.answer("⛔ Только для администраторов.")
+        return
+
+    lines = ["👥 **Администраторы**\n"]
+    lines.append(f"• 👑 {ADMIN_ID} — владелец")
+    for did in sorted(_dynamic_admins):
+        lines.append(f"• {did} — назначен")
+    if not _dynamic_admins:
+        lines.append("_(назначенных админов нет)_")
+    await event.message.answer("\n".join(lines), format="markdown")
+
+
+@dp.message_callback(F.callback.payload == "adminlist")
+async def callback_adminlist(event: MessageCallback):
+    user_id = event.callback.user.user_id
+    chat_id = event.message.recipient.chat_id
+
+    if not is_admin(user_id):
+        await event.answer(notification="⛔ Только администратору")
+        return
+
+    await event.answer(notification="👥 Админы")
+    lines = ["👥 **Администраторы**\n"]
+    lines.append(f"• 👑 {ADMIN_ID} — владелец")
+    for did in sorted(_dynamic_admins):
+        lines.append(f"• {did} — назначен")
+    if not _dynamic_admins:
+        lines.append("_(назначенных админов нет)_")
+    await bot.send_message(chat_id=chat_id, text="\n".join(lines), format="markdown")
+
+
+# BTN: кнопки ➕/➖ Админы (диалог ввода ID)
+@dp.message_callback(F.callback.payload == "addadmin")
+async def callback_addadmin(event: MessageCallback):
+    user_id = event.callback.user.user_id
+    chat_id = event.message.recipient.chat_id
+
+    if not is_owner(user_id):
+        await event.answer(notification="⛔ Только владельцу")
+        return
+
+    await event.answer(notification="Введите ID")
+    user_states[user_id] = UserState.WAITING_ADDADMIN_ID
+    await bot.send_message(
+        chat_id=chat_id,
+        text="➕ **Назначение админа**\n\n"
+             "Отправьте user_id пользователя (только число).\n"
+             "Он должен хотя бы раз писать боту.\n"
+             "Для отмены — /cancel.",
+        format="markdown",
+        attachments=[create_cancel_menu()]
+    )
+
+
+@dp.message_callback(F.callback.payload == "deladmin")
+async def callback_deladmin(event: MessageCallback):
+    user_id = event.callback.user.user_id
+    chat_id = event.message.recipient.chat_id
+
+    if not is_owner(user_id):
+        await event.answer(notification="⛔ Только владельцу")
+        return
+
+    await event.answer(notification="Введите ID")
+    user_states[user_id] = UserState.WAITING_DELADMIN_ID
+    await bot.send_message(
+        chat_id=chat_id,
+        text="➖ **Снятие админа**\n\n"
+             "Отправьте user_id администратора (только число).\n"
+             "Для отмены — /cancel.",
+        format="markdown",
+        attachments=[create_cancel_menu()]
+    )
+
+
 # ---------- АДМИН-КОМАНДЫ СВЕРКИ ----------
 
-@dp.message_created(Command('refresh_debt'))
-async def cmd_refresh_debt(event: MessageCreated):
-    """Ручная проверка в любой день. Триггеры проверяются как в понедельник:
-    если оба обновились — зачёт + рассылка."""
-    user_id = event.message.sender.user_id
-    chat_id = event.message.recipient.chat_id
-
-    if user_id != ADMIN_ID:
-        await event.message.answer("⛔ Эта команда только для администратора.")
-        return
-
-    if not DEBT_SHEET_IDS:
-        await event.message.answer("⚠️ DEBT_SHEET_IDS не задан в настройках.")
-        return
-
-    await event.message.answer("🔎 Проверяю таблицы…")
-    status = await scheduled_check(force_weekday=True)
-    await event.message.answer(status)
-
-
-@dp.message_created(Command('debt_status'))
-async def cmd_debt_status(event: MessageCreated):
-    user_id = event.message.sender.user_id
-    chat_id = event.message.recipient.chat_id
-
-    if user_id != ADMIN_ID:
-        await event.message.answer("⛔ Эта команда только для администратора.")
-        return
-
-    if not DEBT_SHEET_IDS:
-        await event.message.answer("❌ DEBT_SHEET_IDS не задан.")
-        return
-
+def _debt_status_text() -> str:
     now = datetime.now(MSK)
     wd_names = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
 
@@ -1415,6 +1857,10 @@ async def cmd_debt_status(event: MessageCreated):
     lines.append(f"• Лист-триггер: «{DEBT_SOURCE_SHEET}»")
 
     st = _debt_state
+    # STATUS-YEAR: метка года значением
+    yl = st.get('year_label')
+    lines.append(f"• Метка года: {yl if yl else '—'}")
+
     today = now.date().isoformat()
     if st['trig_committed_on'] == today:
         lines.append("• Триггеры: ✅ недельное обновление сегодня зачтено — до следующего пн не проверяются\n")
@@ -1428,9 +1874,17 @@ async def cmd_debt_status(event: MessageCreated):
         lt = st['last_sigs_t']
         if tb and lt and i - 1 < len(lt) and lt[i - 1]:
             if tb[i - 1] != lt[i - 1]:
-                parts.append("• Триггер: 🟡 изменился (ждём остальные)")
+                parts.append("• Триггер (ст. «Количество»): 🟡 изменился (ждём остальные)")
             else:
-                parts.append("• Триггер: ✅ без изменений")
+                parts.append("• Триггер (ст. «Количество»): ✅ без изменений")
+        trb = st.get('trig_rows_baseline')
+        lrt = st.get('last_rows_t')
+        if trb and lrt and i - 1 < len(trb) and i - 1 < len(lrt) \
+                and trb[i - 1] is not None and lrt[i - 1] is not None:
+            if lrt[i - 1] != trb[i - 1]:
+                parts.append(f"• Выгрузка: 🟡 строк {lrt[i - 1]} (baseline {trb[i - 1]})")
+            else:
+                parts.append(f"• Выгрузка: ✅ {lrt[i - 1]} строк")
         db = st['data_baseline']
         ld = st['last_sigs_d']
         if db and ld and i - 1 < len(ld) and ld[i - 1]:
@@ -1443,13 +1897,69 @@ async def cmd_debt_status(event: MessageCreated):
     if st['last_check']:
         lines.append(f"\n• Последняя проверка: {st['last_check']:%d.%m.%Y %H:%M:%S} МСК")
 
-    rows = _load_debt_rows()
-    loaded_at = _debt_cache.get('loaded_at')
-    lines.append(f"• Записей в активной сверке: {len(rows) if rows is not None else '⚠️ файлы не читаются'}")
-    if loaded_at:
-        lines.append(f"• Сверка прочитана ботом: {loaded_at:%d.%m %H:%M:%S}")
+    return "\n".join(lines)
 
-    await event.message.answer("\n".join(lines), format="markdown")
+
+@dp.message_created(Command('refresh_debt'))
+async def cmd_refresh_debt(event: MessageCreated):
+    user_id = event.message.sender.user_id
+    chat_id = event.message.recipient.chat_id
+
+    if not is_admin(user_id):
+        await event.message.answer("⛔ Эта команда только для администратора.")
+        return
+
+    if not DEBT_SHEET_IDS:
+        await event.message.answer("⚠️ DEBT_SHEET_IDS не задан в настройках.")
+        return
+
+    await event.message.answer("🔎 Проверяю таблицы…")
+    status = await scheduled_check(force_weekday=True)
+    await event.message.answer(status, format="markdown")
+
+
+@dp.message_created(Command('debt_status'))
+async def cmd_debt_status(event: MessageCreated):
+    user_id = event.message.sender.user_id
+    chat_id = event.message.recipient.chat_id
+
+    if not is_admin(user_id):
+        await event.message.answer("⛔ Эта команда только для администратора.")
+        return
+
+    if not DEBT_SHEET_IDS:
+        await event.message.answer("❌ DEBT_SHEET_IDS не задан.")
+        return
+
+    await event.message.answer(_debt_status_text(), format="markdown")
+
+
+# BTN: колбэки админ-кнопок сверки
+@dp.message_callback(F.callback.payload == "refresh_debt")
+async def callback_refresh_debt(event: MessageCallback):
+    user_id = event.callback.user.user_id
+    chat_id = event.message.recipient.chat_id
+
+    if not is_admin(user_id):
+        await event.answer(notification="⛔ Только администратору")
+        return
+
+    await event.answer(notification="🔎 Проверяю таблицы…")
+    status = await scheduled_check(force_weekday=True)
+    await bot.send_message(chat_id=chat_id, text=status, format="markdown")
+
+
+@dp.message_callback(F.callback.payload == "debt_status")
+async def callback_debt_status(event: MessageCallback):
+    user_id = event.callback.user.user_id
+    chat_id = event.message.recipient.chat_id
+
+    if not is_admin(user_id):
+        await event.answer(notification="⛔ Только администратору")
+        return
+
+    await event.answer(notification="📊 Статус сверки")
+    await bot.send_message(chat_id=chat_id, text=_debt_status_text(), format="markdown")
 
 
 # ---------- ОСТАЛЬНЫЕ ОБРАБОТЧИКИ ----------
@@ -1463,7 +1973,7 @@ async def callback_info(event: MessageCallback):
     await event.answer(notification="ℹ️ О боте")
     await bot.send_message(
         chat_id=chat_id,
-        text="ℹ️ **О боте**\n\nВерсия: 1.3\nНазначение: автоматизация новостных рассылок для подписчиков и предоставление общей информации по сотрудничеству.\nРазработчик: Александр К.",
+        text="ℹ️ **О боте**\n\nВерсия: 1.9\nНазначение: автоматизация новостных рассылок для подписчиков и предоставление общей информации по сотрудничеству.",
         format="markdown",
         attachments=[create_main_menu(user_id)]
     )
@@ -1650,26 +2160,8 @@ async def callback_back_to_main(event: MessageCallback):
     await event.answer(notification="🔙 Возврат")
     await bot.send_message(
         chat_id=chat_id,
-        text="Главное меню:",
+        text="🏠 Главное меню:",
         attachments=[create_main_menu(user_id)]
-    )
-
-
-@dp.message_callback(F.callback.payload == "support")
-async def callback_support(event: MessageCallback):
-    user = event.callback.user
-    user_id = user.user_id
-    chat_id = event.message.recipient.chat_id
-    ensure_user(user_id, chat_id, getattr(user, 'username', None), getattr(user, 'first_name', None))
-    user_states[user_id] = UserState.SUPPORT_MODE
-    await event.answer(notification="💬 Поддержка активирована")
-    await bot.send_message(
-        chat_id=chat_id,
-        text="💬 **Поддержка**\n\n"
-             "Напишите ваше сообщение, и я перешлю его администратору.\n"
-             "Для отмены нажмите кнопку «Отмена» или введите команду /cancel.",
-        format="markdown",
-        attachments=[create_cancel_menu()]
     )
 
 
@@ -1680,7 +2172,7 @@ async def callback_broadcast(event: MessageCallback):
     chat_id = event.message.recipient.chat_id
     ensure_user(user_id, chat_id, getattr(user, 'username', None), getattr(user, 'first_name', None))
 
-    if user_id != ADMIN_ID:
+    if not is_admin(user_id):
         await event.answer(notification="⛔ Доступно только администратору")
         await bot.send_message(
             chat_id=chat_id,
@@ -1725,7 +2217,7 @@ async def cmd_broadcast(event: MessageCreated):
     chat_id = event.message.recipient.chat_id
     ensure_user(user_id, chat_id, getattr(user, 'username', None), getattr(user, 'first_name', None))
 
-    if user_id != ADMIN_ID:
+    if not is_admin(user_id):
         await event.message.answer("⛔ Эта команда только для администратора.")
         return
 
@@ -1754,64 +2246,9 @@ async def cmd_cancel(event: MessageCreated):
     )
 
 
-@dp.message_created(Command('reply'))
-async def cmd_reply(event: MessageCreated):
-    user = event.message.sender
-    user_id = user.user_id
-    chat_id = event.message.recipient.chat_id
-    ensure_user(user_id, chat_id, getattr(user, 'username', None), getattr(user, 'first_name', None))
-
-    if user_id != ADMIN_ID:
-        await event.message.answer("⛔ Эта команда только для администратора.")
-        return
-
-    body = getattr(event.message, 'body', None)
-    text = (getattr(body, 'text', None) or '') if body else ''
-
-    match = re.match(r'^/reply\s+(\d+)\s+(.+)$', text, re.DOTALL)
-    if not match:
-        await event.message.answer(
-            "❌ Неверный формат.\n"
-            "Используйте: `/reply <user_id> <текст>`\n"
-            "Пример: `/reply 123456789 Привет, ваш вопрос решён!`",
-            format="markdown"
-        )
-        return
-
-    target_user_id = int(match.group(1))
-    reply_text = match.group(2).strip()
-    if not reply_text:
-        await event.message.answer("❌ Текст ответа не может быть пустым.")
-        return
-
-    users = load_users()
-    target_data = users.get(str(target_user_id))
-    if not target_data:
-        await event.message.answer(f"❌ Пользователь с ID {target_user_id} не найден в базе.")
-        return
-
-    target_chat_id = target_data.get('chat_id')
-    if not target_chat_id:
-        await event.message.answer(f"❌ Для пользователя {target_user_id} не найден chat_id.")
-        return
-
-    try:
-        await bot.send_message(
-            chat_id=target_chat_id,
-            text=f"📨 **Ответ администратора:**\n\n{reply_text}",
-            format="markdown"
-        )
-        await event.message.answer(f"✅ Ответ отправлен пользователю {target_user_id}.")
-        logger.info(f"Администратор ответил пользователю {target_user_id}")
-    except Exception as e:
-        logger.error(f"Ошибка отправки ответа пользователю {target_user_id}: {e}")
-        await event.message.answer("❌ Не удалось отправить ответ. Проверьте ID пользователя или права бота.")
-
-
 # ---------- ОТПРАВКА КАРТИНОК ----------
 
 def _pick_upload_type():
-    """Член enum UploadType ('image' или 'images'); иначе строка-фолбэк."""
     if UploadType is not None:
         for cand in ("image", "images"):
             for member in UploadType:
@@ -1821,10 +2258,6 @@ def _pick_upload_type():
 
 
 def _extract_token(raw):
-    """Достаёт токен для вложения из ответа загрузки.
-    Особенность MAX API: ответ загрузки имеет вид
-    {"photos": {"<КЛЮЧ>": {"token": "..."}}} — во вложение
-    передаётся КЛЮЧ из словаря photos, а не поле token внутри."""
     if raw is None:
         return None
     if not isinstance(raw, str):
@@ -1835,7 +2268,7 @@ def _extract_token(raw):
             j = json.loads(s)
             photos = j.get("photos") if isinstance(j, dict) else None
             if isinstance(photos, dict) and photos:
-                return str(next(iter(photos)))   # ← ключ из photos
+                return str(next(iter(photos)))
             if isinstance(j, dict):
                 for k in ("token", "file_token", "id", "result"):
                     if k in j:
@@ -1846,8 +2279,6 @@ def _extract_token(raw):
 
 
 def _upload_direct_sync(upload_url: str, path: str, filename: str) -> str:
-    """Прямая загрузка поверх urllib (запасной путь, без maxapi):
-    файл телом запроса, при отказе — multipart."""
     with open(path, "rb") as f:
         data = f.read()
     try:
@@ -1872,24 +2303,17 @@ def _upload_direct_sync(upload_url: str, path: str, filename: str) -> str:
 
 
 async def send_image(chat_id: int, image_path_or_url: str, caption: str = ""):
-    """URL — по ссылке. Локальный файл — загрузка → отправка.
-    Ключ photos достаётся: (1) из сырого ответа загрузки, если там JSON;
-    (2) из текста ошибки сервера при отправке (там сервер сам его показывает).
-    500-е ретраятся (до 3 раз), 400 с подсказкой — мгновенный ретрай с ключом."""
-
     if not image_path_or_url:
         logger.warning("Путь/URL изображения не указан")
         return
 
     try:
-        # ---------- Ветка URL ----------
         if image_path_or_url.startswith("http"):
             att = Attachment(type="image", payload={"url": image_path_or_url})
             await bot.send_message(chat_id=chat_id, text=caption, attachments=[att])
             logger.info(f"Изображение отправлено (URL): {image_path_or_url}")
             return
 
-        # ---------- Локальный файл ----------
         if not os.path.exists(image_path_or_url):
             logger.warning(f"Файл не найден: {image_path_or_url}")
             return
@@ -1897,7 +2321,6 @@ async def send_image(chat_id: int, image_path_or_url: str, caption: str = ""):
         filename = os.path.basename(image_path_or_url)
         utype = _pick_upload_type()
 
-        # --- 1. upload URL ---
         up = await bot.get_upload_url(type=utype)
         up_url = None
         if isinstance(up, str) and up.startswith("http"):
@@ -1911,7 +2334,6 @@ async def send_image(chat_id: int, image_path_or_url: str, caption: str = ""):
         if not up_url:
             raise RuntimeError(f"Не нашли upload URL в ответе: {up!r}")
 
-        # --- 2. Загрузка (3 способа), сохраняем СЫРОЙ ответ ---
         with open(image_path_or_url, "rb") as f:
             data = f.read()
 
@@ -1938,71 +2360,54 @@ async def send_image(chat_id: int, image_path_or_url: str, caption: str = ""):
         if not token:
             raise RuntimeError(f"Токен не извлечён из: {str(raw_upload)[:200]}")
 
-        # --- 3. Отправка с перебором кандидатов и умным ретраем ---
         def _send(tok):
             return bot.send_message(
                 chat_id=chat_id, text=caption,
                 attachments=[Attachment(type="image", payload={"token": tok})]
             )
 
+        candidates = [token]
+        raw_s = str(raw_upload).strip() if raw_upload is not None else ""
+        if raw_s.startswith("{") and raw_s != token:
+            candidates.append(raw_s)
+
         last_err: Optional[Exception] = None
-        tried_keys = set()          # ключи, которые уже пробовали
-        current = token
-        used_json_full = False      # пробовали ли «весь JSON» как токен
+        i = 0
+        while i < len(candidates):
+            cand = candidates[i]
+            for attempt in range(1, 4):
+                try:
+                    await _send(cand)
+                    logger.info(f"Изображение отправлено (файл): {image_path_or_url}")
+                    return
+                except Exception as e:
+                    last_err = e
+                    es = str(e)
 
-        for round_no in range(1, 9):   # жёсткий предел 8 итераций
-            if current in tried_keys:
-                # исчерпали разумные варианты — пробуем «весь JSON», затем выходим
-                if not used_json_full:
-                    raw_s = str(raw_upload).strip()
-                    if raw_s.startswith("{") and raw_s != current:
-                        used_json_full = True
-                        current = raw_s
-                        logger.info("Стратегия: отправляю весь JSON ответа как токен")
-                        continue
-                break
+                    m = re.search(r'photos"\s*:\s*\{\s*"((?:[^"\\]|\\.)*)"', es)
+                    if m:
+                        key = m.group(1)
+                        try:
+                            key = key.encode('utf-8').decode('unicode_escape')
+                        except Exception:
+                            key = key.replace('\\u003d', '=')
+                        if key != cand and key not in candidates:
+                            logger.info("Сервер подсказал ключ photos — добавляю кандидатом")
+                            candidates.append(key)
 
-            tried_keys.add(current)
-            try:
-                await _send(current)
-                logger.info(f"Изображение отправлено (файл): {image_path_or_url}")
-                return
-            except Exception as e:
-                last_err = e
-                es = str(e)
-                logger.info(f"Отправка с токеном {str(current)[:24]}… не удалась: {es[:140]}")
-
-                # (1) Сервер показал photos-структуру → достаём ключ напрямую
-                #     из ТЕКСТА ошибки (устойчиво к \u003d и мусору self.raw=...)
-                m = re.search(r'photos"\s*:\s*\{\s*"((?:[^"\\]|\\.)*)"', es)
-                if m:
-                    key = m.group(1)
-                    # раскодируем \u003d и прочие \uXXXX
-                    try:
-                        key = key.encode('utf-8').decode('unicode_escape')
-                    except Exception:
-                        key = key.replace('\\u003d', '=')
-                    if key not in tried_keys:
-                        logger.info(f"Сервер подсказал ключ photos: {key[:32]}… — ретрай")
-                        current = key
+                    if ('internal.error' in es or 'code=500' in es
+                            or "'code': 500" in es or 'Error ID' in es):
+                        logger.warning(f"500 (попытка {attempt}/3), пауза 3 с…")
+                        await asyncio.sleep(3)
                         continue
 
-                # (2) Транзиентная 500 → пауза и повтор с тем же токеном
-                if ('internal.error' in es or 'code=500' in es
-                        or "'code': 500" in es or 'Error ID' in es):
-                    logger.warning(f"500 от сервера (круг {round_no}), пауза 3 с…")
-                    await asyncio.sleep(3)
-                    continue
+                    break
+            i += 1
 
-                # (3) Иное — выходим, ниже фолбэк/ошибка
-                break
-
-        # ---------- Фолбэк: URL из .env, если он задан для этого файла ----------
         raise RuntimeError(f"Не удалось отправить изображение; последняя ошибка: {last_err}")
 
     except Exception as e:
         logger.error(f"Ошибка отправки изображения {image_path_or_url}: {e}")
-
 
 
 # ---------- ОСНОВНОЙ ОБРАБОТЧИК ТЕКСТА ----------
@@ -2030,12 +2435,92 @@ async def handle_text(event: MessageCreated):
 
     state = user_states.get(user_id)
 
-    # ---------- РЕЖИМ ОЖИДАНИЯ (USERINFO) ----------
     if state == UserState.WAITING_FOR_FORWARD:
         await process_userinfo_input(event, user_id, chat_id, text)
         return
 
-    # ---------- АДМИН: ВВОД ФИО КЛИЕНТА ----------
+    # ВЛАДЕЛЕЦ: ввод ID для кнопок ➕/➖ Админы
+    if state == UserState.WAITING_ADDADMIN_ID:
+        raw = text.strip().strip('`')
+        if not raw.isdigit():
+            await event.message.answer(
+                "⚠️ Нужно число — user_id пользователя.\n"
+                "Пример: `65700242`\nДля отмены — /cancel.",
+                format="markdown",
+                attachments=[create_cancel_menu()]
+            )
+            return
+
+        new_id = int(raw)
+        if new_id == ADMIN_ID:
+            await event.message.answer("ℹ️ Владелец уже является администратором.",
+                                       attachments=[create_main_menu(user_id)])
+            user_states.pop(user_id, None)
+            return
+        if new_id in _dynamic_admins:
+            await event.message.answer(f"ℹ️ Пользователь {new_id} уже администратор.",
+                                       attachments=[create_main_menu(user_id)])
+            user_states.pop(user_id, None)
+            return
+        if str(new_id) not in load_users():
+            await event.message.answer(
+                f"⚠️ Пользователь {new_id} не найден в базе.\n"
+                "Он должен хотя бы раз написать боту (/start).",
+                attachments=[create_cancel_menu()]
+            )
+            return
+
+        _dynamic_admins.add(new_id)
+        _save_admins()
+        user_states.pop(user_id, None)
+        logger.info(f"Владелец назначил админа: {new_id}")
+        await event.message.answer(
+            f"✅ Пользователь `{new_id}` назначен администратором.",
+            format="markdown",
+            attachments=[create_main_menu(user_id)])
+        try:
+            await bot.send_message(chat_id=new_id, text="🎉 Вам выданы права администратора бота.")
+        except Exception:
+            pass
+        return
+
+    if state == UserState.WAITING_DELADMIN_ID:
+        raw = text.strip().strip('`')
+        if not raw.isdigit():
+            await event.message.answer(
+                "⚠️ Нужно число — user_id администратора.\nДля отмены — /cancel.",
+                format="markdown",
+                attachments=[create_cancel_menu()]
+            )
+            return
+
+        del_id = int(raw)
+        if del_id == ADMIN_ID:
+            await event.message.answer("⛔ Нельзя снять самого владельца.",
+                                       attachments=[create_main_menu(user_id)])
+            user_states.pop(user_id, None)
+            return
+        if del_id not in _dynamic_admins:
+            await event.message.answer(
+                f"ℹ️ Пользователь {del_id} не является динамическим админом.",
+                attachments=[create_main_menu(user_id)])
+            user_states.pop(user_id, None)
+            return
+
+        _dynamic_admins.discard(del_id)
+        _save_admins()
+        user_states.pop(user_id, None)
+        logger.info(f"Владелец снял админа: {del_id}")
+        await event.message.answer(
+            f"✅ Права администратора сняты с `{del_id}`.",
+            format="markdown",
+            attachments=[create_main_menu(user_id)])
+        try:
+            await bot.send_message(chat_id=del_id, text="ℹ️ Права администратора бота отозваны.")
+        except Exception:
+            pass
+        return
+
     if state == UserState.ADMIN_DEBT_MODE:
         full_name = text.strip()
         if len(full_name.split()) < 2:
@@ -2052,7 +2537,6 @@ async def handle_text(event: MessageCreated):
         await process_admin_debt_search(user_id, chat_id, full_name)
         return
 
-    # ---------- АДМИН: УТОЧНЕНИЕ ОТЧЕСТВА КЛИЕНТА ----------
     if state == UserState.ADMIN_DEBT_CLARIFY_MODE:
         data = admin_debt_data.get(user_id)
         if not data:
@@ -2107,7 +2591,6 @@ async def handle_text(event: MessageCreated):
             )
         return
 
-    # ---------- РЕЖИМ УТОЧНЕНИЯ ОТЧЕСТВА (пользователь) ----------
     if state == UserState.DEBT_CLARIFY_MODE:
         entered = text.strip()
         data = user_clarify_data.get(user_id)
@@ -2166,7 +2649,6 @@ async def handle_text(event: MessageCreated):
             )
         return
 
-    # ---------- РЕЖИМ ВВОДА ФИО (пользователь) ----------
     if state == UserState.DEBT_NAME_MODE:
         full_name = text.strip()
         if len(full_name.split()) < 2:
@@ -2185,53 +2667,8 @@ async def handle_text(event: MessageCreated):
         await process_debt_search(user_id, chat_id, full_name)
         return
 
-    # ---------- РЕЖИМ ПОДДЕРЖКИ ----------
-    if state == UserState.SUPPORT_MODE:
-        admin_chat_id = None
-        if ADMIN_ID:
-            users = load_users()
-            admin_data = users.get(str(ADMIN_ID))
-            admin_chat_id = admin_data.get('chat_id') if admin_data else None
-
-        if not admin_chat_id:
-            user_states.pop(user_id, None)
-            logger.error("Поддержка недоступна: администратор не настроен")
-            await event.message.answer(
-                "⚠️ К сожалению, поддержка сейчас недоступна. Попробуйте позже.",
-                attachments=[create_main_menu(user_id)]
-            )
-            return
-
-        username_str = f"@{username}" if username else "без username"
-        try:
-            await bot.send_message(
-                chat_id=admin_chat_id,
-                text=f"📩 **Новое обращение в поддержку**\n\n"
-                     f"От: {name} ({username_str})\n"
-                     f"ID пользователя: `{user_id}`\n"
-                     f"Сообщение:\n{text}",
-                format="markdown"
-            )
-        except Exception as e:
-            logger.error(f"Не удалось переслать сообщение админу: {e}")
-            await event.message.answer(
-                "⚠️ Ошибка отправки. Попробуйте позже.",
-                attachments=[create_cancel_menu()]
-            )
-            return
-
-        user_states.pop(user_id, None)
-        logger.info(f"Обращение в поддержку от user_id={user_id} переслано администратору")
-        await event.message.answer(
-            "✅ Сообщение отправлено!\n"
-            "Мы ответим в ближайшее время.",
-            attachments=[create_main_menu(user_id)]
-        )
-        return
-
-    # ---------- РЕЖИМ РАССЫЛКИ ----------
     if state == UserState.BROADCAST_MODE:
-        if user_id != ADMIN_ID:
+        if not is_admin(user_id):
             user_states.pop(user_id, None)
             await event.message.answer(
                 "⛔ Доступно только администратору.",
@@ -2270,12 +2707,11 @@ async def handle_text(event: MessageCreated):
         )
         return
 
-    # ---------- АДМИНИСТРАТОР БЕЗ АКТИВНОГО РЕЖИМА ----------
-    if user_id == ADMIN_ID:
+    if is_admin(user_id):
         await event.message.answer(
             "👋 Вы администратор. Используйте:\n"
+            "• /menu или /start – показать меню с кнопками\n"
             "• /broadcast – для рассылки новостей\n"
-            "• /reply <id> <текст> – для ответа пользователю\n"
             "• /userinfo – для получения данных пользователя\n"
             "• /debt или кнопка «Долг» – проверить задолженность по ФИО клиента\n"
             "• /refresh_debt – проверить таблицы сверки сейчас\n"
@@ -2285,7 +2721,6 @@ async def handle_text(event: MessageCreated):
         )
         return
 
-    # ---------- ОБЫЧНЫЙ ПОЛЬЗОВАТЕЛЬ ----------
     await event.message.answer(
         "Не понял вас. Используйте кнопки под сообщениями или /help для справки.",
         attachments=[create_main_menu(user_id)]
@@ -2314,13 +2749,6 @@ async def handle_non_text(event: MessageCreated):
         await process_userinfo_input(event, user_id, chat_id, text or "")
         return
 
-    if state == UserState.SUPPORT_MODE:
-        await event.message.answer(
-            "⚠️ Пожалуйста, отправьте сообщение текстом — вложения не пересылаются.",
-            attachments=[create_cancel_menu()]
-        )
-        return
-
     if state in (UserState.ADMIN_DEBT_MODE, UserState.ADMIN_DEBT_CLARIFY_MODE):
         await event.message.answer(
             "⚠️ Введите ФИО текстом.",
@@ -2336,25 +2764,29 @@ async def handle_non_text(event: MessageCreated):
 async def main():
     logger.info("Запуск бота...")
 
-    await bot.set_commands(
+    # Регистрируем команды на сервере MAX; результат логируем для диагностики
+    res = await bot.set_commands(
         BotCommand(name="start", description="Главное меню"),
+        BotCommand(name="menu", description="Главное меню"),
         BotCommand(name="help", description="Справка"),
         BotCommand(name="debt", description="Долг"),
         BotCommand(name="change_name", description="Сменить ФИО"),
-        BotCommand(name="userinfo", description="Данные контакта (админ)"),
+        BotCommand(name="userinfo", description="ID контакта (админ)"),
         BotCommand(name="broadcast", description="Рассылка (только админ)"),
-        BotCommand(name="reply", description="Ответ пользователю (только админ)"),
-        BotCommand(name="refresh_debt", description="Проверить сверку сейчас (админ)"),
+        BotCommand(name="refresh_debt", description="Обновить сверку (админ)"),
         BotCommand(name="debt_status", description="Статус сверки (админ)"),
+        BotCommand(name="adminlist", description="Список админов"),
         BotCommand(name="cancel", description="Отменить текущее действие"),
     )
+    logger.info(f"set_commands результат: {res!r}")
 
     await bot.delete_webhook()
 
     # Фоновый цикл: стартовая загрузка + расписание пн/вт-пт/сб-вс
     asyncio.create_task(debt_refresh_loop())
 
-    await dp.start_polling(bot)
+    # Не обрабатывать накопившиеся за офлайн-время события
+    await dp.start_polling(bot, skip_updates=True)
 
 
 if __name__ == "__main__":
