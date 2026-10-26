@@ -22,6 +22,7 @@ import logging
 import re
 import math
 import time
+import tempfile
 import urllib.request
 import urllib.error
 from datetime import datetime, timedelta, timezone
@@ -104,12 +105,69 @@ DEBT_STATE_FILE = os.getenv("DEBT_STATE_FILE", "data/debt_state.json")
 DOWNLOAD_TIMEOUT = int(os.getenv("DOWNLOAD_TIMEOUT", "120"))
 DOWNLOAD_RETRIES = int(os.getenv("DOWNLOAD_RETRIES", "3"))
 
-REGION1_APP = os.getenv("REGION1_APP", "https://example.com/app1.jpg")
-REGION1_QR = os.getenv("REGION1_QR", "https://example.com/qr1.jpg")
-REGION1_BANK = os.getenv("REGION1_BANK", "https://example.com/bank1.jpg")
-REGION2_APP = os.getenv("REGION2_APP", "https://example.com/app2.jpg")
-REGION2_QR = os.getenv("REGION2_QR", "https://example.com/qr2.jpg")
-REGION2_BANK = os.getenv("REGION2_BANK", "https://example.com/bank2.jpg")
+def _normalize_gdrive_url(url: str) -> str:
+    """Преобразует любую ссылку Google Drive в прямую (без редиректа),
+    которую сервер MAX скачивает сам без ошибки 'Failed to upload image'.
+    Понимает форматы: /file/d/ID/view, /open?id=ID, /uc?...&id=ID.
+    Уже прямые и сторонние (не Google) ссылки возвращает как есть."""
+    if not url or "drive.google.com" not in url:
+        return url
+    m = re.search(r"drive\.google\.com/file/d/([A-Za-z0-9_-]{10,})", url)
+    file_id = m.group(1) if m else None
+    if not file_id:
+        m = re.search(r"[?&]id=([A-Za-z0-9_-]{10,})", url)
+        file_id = m.group(1) if m else None
+    if not file_id:
+        logger.warning(f"Не удалось извлечь FILE_ID из ссылки Google: {url}")
+        return url
+    direct = f"https://drive.usercontent.google.com/download?id={file_id}&export=download"
+    if direct != url:
+        logger.info(f"Ссылка Google преобразована в прямую: {url} → {direct}")
+    return direct
+
+
+# Картинки карточек: в .env можно вставлять ЛЮБУЮ ссылку Google Drive —
+# она автоматически приводится к прямому виду при старте бота.
+REGION1_APP = _normalize_gdrive_url(os.getenv("REGION1_APP", "https://example.com/app1.jpg"))
+REGION1_QR = _normalize_gdrive_url(os.getenv("REGION1_QR", "https://example.com/qr1.jpg"))
+REGION1_BANK = _normalize_gdrive_url(os.getenv("REGION1_BANK", "https://example.com/bank1.jpg"))
+REGION2_APP = _normalize_gdrive_url(os.getenv("REGION2_APP", "https://example.com/app2.jpg"))
+REGION2_QR = _normalize_gdrive_url(os.getenv("REGION2_QR", "https://example.com/qr2.jpg"))
+REGION2_BANK = _normalize_gdrive_url(os.getenv("REGION2_BANK", "https://example.com/bank2.jpg"))
+
+# Реквизиты для оплаты отправляются ТЕКСТОМ (не картинкой).
+# У КАЖДОГО РЕГИОНА СВОЙ НЕЗАВИСИМЫЙ ОБРАЗЕЦ — правьте их по отдельности.
+# Формат сообщения — markdown: жирный — **текст**, курсив — *текст*.
+# Звёздочки-маркеры в чате НЕ отображаются, видно только начертание.
+# ВАЖНО: если задаёте текст через .env (REGIONx_BANK_TEXT) — звёздочки
+# нужно писать прямо в значении .env.
+# Дополнительно можно переопределить текст через .env:
+#   REGION1_BANK_TEXT — Краснодар, REGION2_BANK_TEXT — КМВ, КЧР.
+
+# --- Регион 1: Краснодар ---
+BANK_DETAILS_1 = (
+    "**Индивидуальный предприниматель Ершов Максим Сергеевич**\n"
+    "**ИНН:** 370225603829\n"
+    "**ОГРНИП:** 322370200022099\n"
+    "**Номер счета:** 40802810138120000533\n"
+    "**Банк:** Ивановский РФ АО \"Россельхозбанк\"\n"
+    "**БИК:** 044525780\n"
+    "**Корр. счет:** 30101810745374525780"
+)
+
+# --- Регион 2: КМВ, КЧР ---
+BANK_DETAILS_2 = (
+    "**Индивидуальный предприниматель Ершов Максим Сергеевич**\n"
+    "**ИНН:** 370225603829\n"
+    "**ОГРНИП:** 322370200022099\n"
+    "**Номер счета:** 40802810138120000533\n"
+    "**Банк:** Ивановский РФ АО \"Россельхозбанк\"\n"
+    "**БИК:** 044525780\n"
+    "**Корр. счет:** 30101810745374525780"
+)
+
+REGION1_BANK_TEXT = os.getenv("REGION1_BANK_TEXT", BANK_DETAILS_1)
+REGION2_BANK_TEXT = os.getenv("REGION2_BANK_TEXT", BANK_DETAILS_2)
 
 if not BOT_TOKEN:
     logger.error("MAX_BOT_TOKEN не найден в .env")
@@ -2062,7 +2120,7 @@ async def callback_region_2(event: MessageCallback):
 async def callback_region1_app(event: MessageCallback):
     chat_id = event.message.recipient.chat_id
     await event.answer(notification="📄 Заявление")
-    await send_image(chat_id, REGION1_APP, "📄 Заявление для Краснодара:")
+    await send_image(chat_id, REGION1_APP, "📄 Заявление о наличии животных")
     await bot.send_message(
         chat_id=chat_id,
         text="📎 **Выберите другой документ:**",
@@ -2075,7 +2133,7 @@ async def callback_region1_app(event: MessageCallback):
 async def callback_region1_qr(event: MessageCallback):
     chat_id = event.message.recipient.chat_id
     await event.answer(notification="📱 QR-код")
-    await send_image(chat_id, REGION1_QR, "📱 QR-код для Краснодара:")
+    await send_image(chat_id, REGION1_QR, "📱 QR-код для оплаты")
     await bot.send_message(
         chat_id=chat_id,
         text="📎 **Выберите другой документ:**",
@@ -2088,7 +2146,7 @@ async def callback_region1_qr(event: MessageCallback):
 async def callback_region1_bank(event: MessageCallback):
     chat_id = event.message.recipient.chat_id
     await event.answer(notification="💳 Реквизиты")
-    await send_image(chat_id, REGION1_BANK, "💳 Реквизиты для Краснодара:")
+    await bot.send_message(chat_id=chat_id, text=f"**💳 Реквизиты для оплаты:**\n\n{REGION1_BANK_TEXT}", format="markdown")
     await bot.send_message(
         chat_id=chat_id,
         text="📎 **Выберите другой документ:**",
@@ -2101,7 +2159,7 @@ async def callback_region1_bank(event: MessageCallback):
 async def callback_region2_app(event: MessageCallback):
     chat_id = event.message.recipient.chat_id
     await event.answer(notification="📄 Заявление")
-    await send_image(chat_id, REGION2_APP, "📄 Заявление для КМВ, КЧР:")
+    await send_image(chat_id, REGION2_APP, "📄 Заявление о наличии животных")
     await bot.send_message(
         chat_id=chat_id,
         text="📎 **Выберите другой документ:**",
@@ -2114,7 +2172,7 @@ async def callback_region2_app(event: MessageCallback):
 async def callback_region2_qr(event: MessageCallback):
     chat_id = event.message.recipient.chat_id
     await event.answer(notification="📱 QR-код")
-    await send_image(chat_id, REGION2_QR, "📱 QR-код для КМВ, КЧР:")
+    await send_image(chat_id, REGION2_QR, "📱 QR-код для оплаты")
     await bot.send_message(
         chat_id=chat_id,
         text="📎 **Выберите другой документ:**",
@@ -2127,7 +2185,7 @@ async def callback_region2_qr(event: MessageCallback):
 async def callback_region2_bank(event: MessageCallback):
     chat_id = event.message.recipient.chat_id
     await event.answer(notification="💳 Реквизиты")
-    await send_image(chat_id, REGION2_BANK, "💳 Реквизиты для КМВ, КЧР:")
+    await bot.send_message(chat_id=chat_id, text=f"**💳 Реквизиты для оплаты:**\n\n{REGION2_BANK_TEXT}", format="markdown")
     await bot.send_message(
         chat_id=chat_id,
         text="📎 **Выберите другой документ:**",
@@ -2268,7 +2326,12 @@ def _extract_token(raw):
             j = json.loads(s)
             photos = j.get("photos") if isinstance(j, dict) else None
             if isinstance(photos, dict) and photos:
-                return str(next(iter(photos)))
+                # Эталон maxapi (_extract_upload_token_from_response):
+                # токен = ЗНАЧЕНИЕ "token" у первого фото, а НЕ ключ словаря!
+                first = next(iter(photos.values()))
+                if isinstance(first, dict) and first.get("token"):
+                    return str(first["token"])
+                return str(first)
             if isinstance(j, dict):
                 for k in ("token", "file_token", "id", "result"):
                     if k in j:
@@ -2302,17 +2365,69 @@ def _upload_direct_sync(upload_url: str, path: str, filename: str) -> str:
         return r.read().decode('utf-8')
 
 
+def _download_image_sync(url: str) -> str:
+    """Скачивает изображение по ссылке во временный файл.
+    Проверяет, что сервер вернул именно картинку, а не HTML-страницу
+    (иначе MAX отвергнет её с 'Failed to upload image')."""
+    req = urllib.request.Request(
+        url, headers={"User-Agent": "Mozilla/5.0 (compatible; MAXBot)"})
+    with urllib.request.urlopen(req, timeout=90) as r:
+        ctype = (r.headers.get("Content-Type") or "").lower()
+        data = r.read()
+    if len(data) < 1024:
+        raise RuntimeError(
+            f"Сервер отдал слишком маленький файл ({len(data)} байт), "
+            f"Content-Type={ctype!r} — вероятно, страница-заглушка")
+    sig = data[:12]
+    ext = None
+    if sig[:8] == b"\x89PNG\r\n\x1a\n":
+        ext = ".png"
+    elif sig[:3] == b"\xff\xd8\xff":
+        ext = ".jpg"
+    elif sig[:6] in (b"GIF87a", b"GIF89a"):
+        ext = ".gif"
+    elif sig[:4] == b"RIFF" and sig[8:12] == b"WEBP":
+        ext = ".webp"
+    if not ext:
+        head = data[:200].decode("utf-8", errors="replace")
+        raise RuntimeError(
+            f"По ссылке вернулся не файл изображения, а страница "
+            f"(Content-Type={ctype!r}): {head[:120]}")
+    fd, path = tempfile.mkstemp(prefix="maxbot_img_", suffix=ext)
+    with os.fdopen(fd, "wb") as f:
+        f.write(data)
+    logger.info(f"Скачано изображение: {len(data)} байт, {ctype or ext}")
+    return path
+
+
 async def send_image(chat_id: int, image_path_or_url: str, caption: str = ""):
     if not image_path_or_url:
         logger.warning("Путь/URL изображения не указан")
         return
 
     try:
+        # Ветка URL: сначала пробуем отдать ссылку серверу MAX.
+        # Если MAX не смог сам скачать URL — качаем сами и загружаем как файл.
         if image_path_or_url.startswith("http"):
-            att = Attachment(type="image", payload={"url": image_path_or_url})
-            await bot.send_message(chat_id=chat_id, text=caption, attachments=[att])
-            logger.info(f"Изображение отправлено (URL): {image_path_or_url}")
-            return
+            try:
+                att = Attachment(type="image", payload={"url": image_path_or_url})
+                await bot.send_message(chat_id=chat_id, text=caption, attachments=[att])
+                logger.info(f"Изображение отправлено (URL): {image_path_or_url}")
+                return
+            except Exception as e_url:
+                logger.warning(
+                    f"Отправка по URL не удалась ({str(e_url)[:160]}); "
+                    f"скачиваю картинку сам и загружаю в MAX как файл")
+                tmp_path = await asyncio.to_thread(
+                    _download_image_sync, image_path_or_url)
+                try:
+                    await send_image(chat_id, tmp_path, caption)
+                finally:
+                    try:
+                        os.remove(tmp_path)
+                    except OSError:
+                        pass
+                return
 
         if not os.path.exists(image_path_or_url):
             logger.warning(f"Файл не найден: {image_path_or_url}")
@@ -2375,6 +2490,7 @@ async def send_image(chat_id: int, image_path_or_url: str, caption: str = ""):
         i = 0
         while i < len(candidates):
             cand = candidates[i]
+            logger.info(f"Отправка вложения, кандидат токена: {str(cand)[:32]}…")
             for attempt in range(1, 4):
                 try:
                     await _send(cand)
