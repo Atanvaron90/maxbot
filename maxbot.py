@@ -9,8 +9,12 @@ MAX Bot — бот с поддержкой, информацией, услови
 «Исходные данные»!A2 первой таблицы; если метка устарела — предупреждение владельцу.
 Администраторы: владелец (ADMIN_ID) + динамические (/addadmin, /deladmin, /adminlist,
 кнопки ➕/➖ в меню владельца), хранятся в data/admins.json.
-Команды: /start /menu, /help, /debt, /change_name, /cancel, /broadcast, /userinfo, /sentlog,
-/refresh_debt, /debt_status, /addadmin, /deladmin, /adminlist.
+Команды: /start /menu, /help, /debt, /change_name, /notify, /cancel, /broadcast, /userinfo,
+/checksent, /refresh_debt, /debt_status, /addadmin, /deladmin, /adminlist.
+
+/notify — личный переключатель еженедельного уведомления «Сверка обновлена»:
+отключить можно ТОЛЬКО это уведомление; результаты проверки задолженности,
+ответы бота и рассылки новостей отключению не подлежат.
 """
 
 import os
@@ -82,8 +86,10 @@ BOT_TOKEN = os.getenv("MAX_BOT_TOKEN")
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
 ADMINS_FILE = os.getenv("ADMINS_FILE", "data/admins.json")
 USERS_FILE = 'data/users.json'
-# Журнал отправок бота (кому и какие сообщения отправлены): массовые рассылки
-# и уведомления. Просмотр админом: команда /sentlog [N] или /sentlog clear.
+# Журнал отправок бота: все отправки контактам, КРОМЕ ответов на команды —
+# рассылки, уведомления, предупреждения, сообщения о правах админа.
+# Файл пишется для диагностики на сервере; просмотр доставки — кнопка «📨 Журнал»
+# в меню или /checksent <ID> (история чата с контактом по данным MAX, не этот файл).
 SENT_LOG_FILE = os.getenv("SENT_LOG_FILE", "data/sent_log.json")
 SENT_LOG_MAX = int(os.getenv("SENT_LOG_MAX", "1000"))
 
@@ -180,8 +186,8 @@ if not BOT_TOKEN:
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
-KNOWN_COMMANDS = {'/start', '/menu', '/help', '/debt', '/change_name', '/cancel',
-                  '/broadcast', '/userinfo', '/sentlog',
+KNOWN_COMMANDS = {'/start', '/menu', '/help', '/debt', '/change_name', '/notify', '/cancel',
+                  '/broadcast', '/userinfo', '/checksent',
                   '/refresh_debt', '/debt_status',
                   '/addadmin', '/deladmin', '/adminlist'}
 
@@ -192,6 +198,7 @@ class UserState(Enum):
     DEBT_NAME_MODE = "debt_name"
     DEBT_CLARIFY_MODE = "debt_clarify"
     WAITING_FOR_FORWARD = "waiting_for_forward"
+    WAITING_CHECKSENT_ID = "waiting_checksent_id"
     ADMIN_DEBT_MODE = "admin_debt"
     ADMIN_DEBT_CLARIFY_MODE = "admin_debt_clarify"
     WAITING_ADDADMIN_ID = "waiting_addadmin_id"
@@ -343,32 +350,30 @@ def clear_user_full_name(user_id: int):
 # ---------- МЕНЮ ----------
 
 def create_main_menu(user_id: int) -> Attachment:
+    """Главное меню — сетка по 3 кнопки в ряду.
+    Пользователь: 2 ряда (4 кнопки), админ: 3 ряда (9), владелец: 4 ряда (12)."""
     admin = is_admin(user_id)
     row1 = [
         CallbackButton(text="📋 Условия", payload="conditions", intent=Intent.DEFAULT),
-        CallbackButton(text="💳 Долг", payload="debt", intent=Intent.DEFAULT)
+        CallbackButton(text="💳 Долг", payload="debt", intent=Intent.DEFAULT),
+        CallbackButton(text="ℹ️ О боте", payload="info", intent=Intent.DEFAULT)
     ]
-    row2 = [
-        CallbackButton(text="ℹ️ О боте", payload="info", intent=Intent.DEFAULT),
+    row2: List[CallbackButton] = [
         CallbackButton(text="❓ Справка", payload="help_command", intent=Intent.DEFAULT)
     ]
     rows = [row1, row2]
 
     if admin:
-        row3: List[CallbackButton] = []
-        if admin:
-            row3.append(CallbackButton(text="📢 Новости", payload="broadcast", intent=Intent.DEFAULT))
-        row3.append(CallbackButton(text="👤 ID контакта", payload="userinfo", intent=Intent.DEFAULT))
-        rows.append(row3)
+        row2.append(CallbackButton(text="📢 Новости", payload="broadcast", intent=Intent.DEFAULT))
+        row2.append(CallbackButton(text="👤 ID контакта", payload="userinfo", intent=Intent.DEFAULT))
         rows.append([
-            CallbackButton(text="🔄 Обновить сверку", payload="refresh_debt", intent=Intent.DEFAULT),
-            CallbackButton(text="📊 Статус сверки", payload="debt_status", intent=Intent.DEFAULT)
+            CallbackButton(text="📨 Журнал", payload="checksent", intent=Intent.DEFAULT),
+            CallbackButton(text="🔄 Обновить", payload="refresh_debt", intent=Intent.DEFAULT),
+            CallbackButton(text="📊 Статус", payload="debt_status", intent=Intent.DEFAULT)
         ])
         if is_owner(user_id):
             rows.append([
-                CallbackButton(text="👥 Админы", payload="adminlist", intent=Intent.DEFAULT)
-            ])
-            rows.append([
+                CallbackButton(text="👥 Админы", payload="adminlist", intent=Intent.DEFAULT),
                 CallbackButton(text="➕ Админ", payload="addadmin", intent=Intent.DEFAULT),
                 CallbackButton(text="➖ Админ", payload="deladmin", intent=Intent.DEFAULT)
             ])
@@ -962,30 +967,34 @@ def _load_sent_log() -> list:
     return []
 
 
-def _log_sent_bulk(recipients: List[tuple], source: str, text: str):
-    """Добавляет в журнал факты УСПЕШНЫХ массовых отправок ботом.
-    recipients — список пар (user_id, user_data); текст обрезается до 200 симв.
-    Хранятся последние SENT_LOG_MAX записей (ротация старых)."""
-    if not recipients:
+def _log_sent_bulk(recipients: List[tuple], source: str, text: str,
+                   failed: Optional[List[tuple]] = None):
+    """Добавляет в журнал факты отправок ботом контактам.
+    recipients — пары (user_id, user_data), доставленные УСПЕШНО (статус ✅);
+    failed — пары (user_id, user_data) с ошибкой доставки (статус ❌).
+    Текст обрезается до 200 симв. Хранятся последние SENT_LOG_MAX записей."""
+    if not recipients and not failed:
         return
     try:
         os.makedirs('data', exist_ok=True)
         entries = _load_sent_log()
         ts = datetime.now(MSK).strftime('%d.%m.%Y %H:%M:%S')
-        for uid, udata in recipients:
-            name = '—'
-            chat_id_u = None
-            if isinstance(udata, dict):
-                name = udata.get('full_name') or udata.get('name') or '—'
-                chat_id_u = udata.get('chat_id')
-            entries.append({
-                'ts': ts,
-                'user_id': uid,
-                'chat_id': chat_id_u,
-                'name': name,
-                'source': source,
-                'text': (text or '')[:200],
-            })
+        for status, group in (('✅', recipients), ('❌', failed or [])):
+            for uid, udata in group:
+                name = '—'
+                chat_id_u = None
+                if isinstance(udata, dict):
+                    name = udata.get('full_name') or udata.get('name') or '—'
+                    chat_id_u = udata.get('chat_id')
+                entries.append({
+                    'ts': ts,
+                    'user_id': uid,
+                    'chat_id': chat_id_u,
+                    'name': name,
+                    'source': source,
+                    'text': (text or '')[:200],
+                    'status': status,
+                })
         if len(entries) > SENT_LOG_MAX:
             entries = entries[-SENT_LOG_MAX:]
         with open(SENT_LOG_FILE, 'w', encoding='utf-8') as f:
@@ -994,15 +1003,54 @@ def _log_sent_bulk(recipients: List[tuple], source: str, text: str):
         logger.error(f"Не удалось записать журнал отправок: {e}")
 
 
+def _log_sent_one(uid: int, chat_id_u: Optional[int], name: Optional[str],
+                  source: str, text: str, ok: bool = True):
+    """Записывает в журнал одну одиночную отправку бота контакту."""
+    group = [(uid, {'chat_id': chat_id_u, 'full_name': name})]
+    if ok:
+        _log_sent_bulk(group, source, text)
+    else:
+        _log_sent_bulk([], source, text, failed=group)
+
+
+async def _notify_contact_and_log(uid: int, source: str, text: str,
+                                  chat_id_u: Optional[int] = None,
+                                  name: Optional[str] = None,
+                                  fmt: Optional[str] = None):
+    """Отправляет одно сообщение контакту и записывает факт доставки в журнал.
+    По умолчанию чат определяется по базе (chat_id), иначе — сам user_id."""
+    users = load_users()
+    udata = users.get(str(uid)) or {}
+    if chat_id_u is None:
+        chat_id_u = udata.get('chat_id') or uid
+    if name is None:
+        name = udata.get('full_name') or udata.get('name') or '—'
+    ok = True
+    try:
+        if fmt:
+            await bot.send_message(chat_id=chat_id_u, text=text, format=fmt)
+        else:
+            await bot.send_message(chat_id=chat_id_u, text=text)
+    except Exception as e:
+        ok = False
+        logger.error(f"«{source}»: не доставлено пользователю {uid}: {e}")
+    _log_sent_one(uid, chat_id_u, name, source, text, ok=ok)
+
+
 async def notify_debt_updated():
     text = "Сверка обновлена. Можно проверить наличие актуальной задолженности."
     users = load_users()
     sent = 0
     errors = 0
+    skipped = 0  # отключили еженедельное уведомление (/notify) — не беспокоим
     ok_recipients: List[tuple] = []
+    fail_recipients: List[tuple] = []
     for uid, user_data in users.items():
         chat_id_user = user_data.get('chat_id')
         if not chat_id_user:
+            continue
+        if user_data.get('recon_notify', True) is False:
+            skipped += 1
             continue
         try:
             await bot.send_message(chat_id=chat_id_user, text=text)
@@ -1010,10 +1058,12 @@ async def notify_debt_updated():
             ok_recipients.append((uid, user_data))
         except Exception as e:
             errors += 1
+            fail_recipients.append((uid, user_data))
             logger.error(f"Уведомление не доставлено пользователю {uid}: {e}")
         await asyncio.sleep(0.2)
-    logger.info(f"Уведомление об обновлении сверки: отправлено {sent}, ошибок {errors}")
-    _log_sent_bulk(ok_recipients, "Уведомление о сверке", text)
+    logger.info(f"Уведомление об обновлении сверки: отправлено {sent}, ошибок {errors}, "
+                f"пропущено (отключили /notify): {skipped}")
+    _log_sent_bulk(ok_recipients, "Уведомление о сверке", text, failed=fail_recipients)
 
 
 def _rows_gain_text(st: Dict, cur_rows: List[Optional[int]]) -> Optional[str]:
@@ -1318,14 +1368,16 @@ async def debt_refresh_loop():
                             users = load_users()
                             a = users.get(str(ADMIN_ID))
                             if a and a.get('chat_id'):
-                                await bot.send_message(
-                                    chat_id=a['chat_id'],
-                                    text=("⚠️ **Проверьте ссылку на таблицы сверки!**\n\n"
-                                          f"Метка года в {DEBT_YEAR_CELL}: "
-                                          f"«{year_val if year_val else '—'}», ожидается {cur_year}.\n\n"
-                                          "Если наступил новый год — обновите DEBT_SHEET_IDS в .env "
-                                          "и перезапустите бота. До этого сверка берётся из прежних таблиц."),
-                                    format="markdown")
+                                await _notify_contact_and_log(
+                                    ADMIN_ID, "⚠️ Предупреждение (год сверки)",
+                                    ("⚠️ **Проверьте ссылку на таблицы сверки!**\n\n"
+                                     f"Метка года в {DEBT_YEAR_CELL}: "
+                                     f"«{year_val if year_val else '—'}», ожидается {cur_year}.\n\n"
+                                     "Если наступил новый год — обновите DEBT_SHEET_IDS в .env "
+                                     "и перезапустите бота. До этого сверка берётся из прежних таблиц."),
+                                    chat_id_u=a['chat_id'],
+                                    name=a.get('full_name') or a.get('name'),
+                                    fmt="markdown")
                             logger.warning(f"Метка года сверки неактуальна: {year_val!r}")
             except Exception as e:
                 logger.error(f"Ошибка проверки метки года: {e}")
@@ -1354,26 +1406,42 @@ def _esc_html(text) -> str:
     return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+def _mention_html(first, last, user_id) -> str:
+    """Ссылка-упоминание max://user/<id> в HTML-режиме MAX.
+
+    Правило официальной документации MAX (max-agents-skill, references/formatting.md):
+    текстом ссылки-упоминания должно быть ПОЛНОЕ ИМЯ ИЗ ПРОФИЛЯ MAX —
+    «имя + фамилия» именно в том порядке, как в профиле; если фамилии нет —
+    только имя. Если текст ссылки не совпадает с именем профиля, MAX НЕ
+    рендерит <a> как ссылку — это и была причина «пропадающих» ссылок у
+    контактов с именем из нескольких слов (мы строили «Фамилия Имя»).
+    """
+    first = (first or '').strip()
+    last = (last or '').strip()
+    display = ' '.join(p for p in (first, last) if p)
+    if not display:
+        return '—'
+    safe = _esc_html(display)
+    try:
+        uid_int = int(user_id)
+    except (TypeError, ValueError):
+        return safe
+    if uid_int <= 0:
+        return safe
+    return f'<a href="max://user/{uid_int}">{safe}</a>'
+
+
+
 def format_user_info_from_dict(user_id: int, user_data: Dict) -> str:
     """Карточка контакта в HTML-формате (MAX поддерживает упоминания только так).
     Имя становится кликабельной ссылкой на чат с пользователем —
     клик открывает чат с этим пользователем."""
     fw_chat_id = user_data.get('chat_id', '—')
-    fw_name = user_data.get('name')
 
-    # Имя — кликабельная HTML-ссылка на чат с пользователем (если есть user_id)
-    if fw_name:
-        try:
-            uid_int = int(user_id)
-            if uid_int > 0:
-                name_field = f'<a href="max://user/{uid_int}">{_esc_html(fw_name)}</a>'
-            else:
-                name_field = _esc_html(fw_name)
-        except (TypeError, ValueError):
-            name_field = _esc_html(fw_name)
-    else:
-        name_field = '—'
-
+    # Имя — кликабельная HTML-ссылка на чат с пользователем (если есть user_id).
+    # Текст ссылки обязан совпадать с полным именем профиля MAX (имя + фамилия),
+    # фамилия добирается из профиля MAX в _ensure_profile_last_name.
+    name_field = _mention_html(user_data.get('name'), user_data.get('last_name'), user_id)
     return (
         "👤 <b>Данные контакта:</b>\n\n"
         f"• <b>User ID:</b> <code>{_esc_html(user_id)}</code>\n"
@@ -1396,24 +1464,10 @@ def format_forwarded_user_info(sender) -> str:
         if udata:
             fw_chat_id = udata.get('chat_id')
 
-    fio = " ".join(filter(None, [fw_last_name, fw_first_name])) or None
-
-    # Имя — кликабельная HTML-ссылка на чат с пользователем
-    if fio:
-        try:
-            if fw_user_id:
-                uid_int = int(fw_user_id)
-                if uid_int > 0:
-                    name_field = f'<a href="max://user/{uid_int}">{_esc_html(fio)}</a>'
-                else:
-                    name_field = _esc_html(fio)
-            else:
-                name_field = _esc_html(fio)
-        except (TypeError, ValueError):
-            name_field = _esc_html(fio)
-    else:
-        name_field = '—'
-
+    # Имя — кликабельная HTML-ссылка на чат с пользователем.
+    # Текст ссылки обязан совпадать с полным именем профиля MAX (имя + фамилия
+    # в порядке профиля), поэтому показываем имя так, как оно записано в MAX.
+    name_field = _mention_html(fw_first_name, fw_last_name, fw_user_id)
     return (
         "👤 <b>Данные контакта:</b>\n\n"
         f"• <b>User ID:</b> <code>{_esc_html(fw_user_id) if fw_user_id else '—'}</code>\n"
@@ -1444,6 +1498,41 @@ def _find_user_by_any_id(uid: int) -> Optional[tuple]:
     return None
 
 
+async def _ensure_profile_last_name(user_id: int, user_data: Dict, chat_id=None) -> None:
+    """Дополняет запись контакта фамилией из профиля MAX (GET /chats/{id}/members).
+
+    Упоминание в MAX работает, только если текст ссылки совпадает с полным
+    именем профиля (имя + фамилия), поэтому для карточек «ID контакта» нужна
+    фамилия. В базе она хранится в поле last_name (добавляется этим хелпером)."""
+    if not user_data or user_data.get('last_name'):
+        return
+    uid = int(user_id)
+    try:
+        members = await bot.get_chat_members(chat_id=int(chat_id or uid), user_ids=[uid])
+    except Exception as e:
+        logger.info(f"Профиль {uid} через members не получен: {e}")
+        return
+    for m in (getattr(members, 'members', None) or []):
+        if getattr(m, 'user_id', None) != uid:
+            continue
+        ln = (getattr(m, 'last_name', None) or '').strip()
+        fn = (getattr(m, 'first_name', None) or '').strip()
+        if ln:
+            user_data['last_name'] = ln
+        if fn and not user_data.get('name'):
+            user_data['name'] = fn
+        users = load_users()
+        u = users.get(str(uid))
+        if u is not None:
+            if ln:
+                u['last_name'] = ln
+            if fn and not u.get('name'):
+                u['name'] = fn
+            save_users(users)
+            logger.info(f"Профиль {uid} дополнен фамилией из MAX")
+        break
+
+
 async def process_userinfo_input(event, user_id: int, chat_id: int, text: str):
     link = getattr(event.message, 'link', None)
     if link and getattr(link, 'sender', None):
@@ -1466,6 +1555,7 @@ async def process_userinfo_input(event, user_id: int, chat_id: int, text: str):
         if found:
             f_uid, f_data = found
             logger.info(f"UserInfo по ID: запрошен {stripped}, найден user_id={f_uid} (запросил админ {user_id})")
+            await _ensure_profile_last_name(f_uid, f_data, f_data.get('chat_id') or f_uid)
             await bot.send_message(
                 chat_id=chat_id,
                 text=format_user_info_from_dict(f_uid, f_data),
@@ -1574,6 +1664,7 @@ async def send_help(chat_id: int, user_id: int):
     if admin:
         text += "• 📢 Новости – сделать рассылку (только для админа)\n"
         text += "• 👤 ID контакта – получить данные пользователя (только для админа)\n"
+        text += "• 📨 Журнал – проверить, что бот отправил сообщение контакту (только для админа)\n"
         text += "• 🔄 Обновить сверку / 📊 Статус сверки – кнопки (только для админа)\n"
     if is_owner(user_id):
         text += "• 👥 Админы – список админов (владелец)\n"
@@ -1585,11 +1676,12 @@ async def send_help(chat_id: int, user_id: int):
     text += "• /help — Эта справка\n"
     text += "• /debt — Узнать долг\n"
     text += "• /change_name — Сменить ФИО\n"
+    text += "• /notify — Вкл/выкл еженедельное уведомление «Сверка обновлена»\n"
     text += "• /cancel — Отменить текущее действие\n"
     if admin:
         text += "• /broadcast — Начать рассылку (только админ)\n"
-        text += "• /sentlog — журнал отправок бота (только админ)\n"
-        text += "• /userinfo — ID контакта (только админ)\n• /sentlog — журнал отправок бота (только админ)\n"
+        text += "• /checksent — журнал сообщений: введите ID контакта — бот покажет последние сообщения бота в его чате по данным MAX (только админ)\n"
+        text += "• /userinfo — ID контакта (только админ)\n"
         text += "• /refresh_debt — Проверить таблицы сверки сейчас (только админ)\n"
         text += "• /debt_status — Статус сверки (только админ)\n"
         text += "• /adminlist — Список админов\n"
@@ -1649,6 +1741,52 @@ async def start_change_name(user_id: int, chat_id: int, event):
     )
     if hasattr(event, 'answer'):
         await event.answer(notification="🔄 Введите новые ФИО")
+
+
+@dp.message_created(Command('notify'))
+async def cmd_notify(event: MessageCreated):
+    """Переключатель личного еженедельного уведомления «Сверка обновлена» (/notify).
+    Отключить можно ТОЛЬКО это уведомление: результаты проверки задолженности,
+    ответы бота и рассылки новостей приходят как раньше."""
+    user = event.message.sender
+    user_id = user.user_id
+    chat_id = event.message.recipient.chat_id
+    ensure_user(user_id, chat_id, getattr(user, 'username', None), getattr(user, 'first_name', None))
+
+    users = load_users()
+    uid = str(user_id)
+    udata = users.get(uid)
+    if not isinstance(udata, dict):
+        udata = {'chat_id': chat_id}
+        users[uid] = udata
+    # Отсутствие поля = уведомления включены (совместимость со старой базой)
+    was_enabled = not (udata.get('recon_notify', True) is False)
+    new_state = not was_enabled  # состояние ПОСЛЕ переключения — его и показываем
+    udata['recon_notify'] = new_state
+    save_users(users)
+    logger.info(f"/notify: пользователь {user_id} — уведомление о сверке "
+                f"{'включено' if new_state else 'отключено'}")
+
+    if new_state:
+        text = ("🔔 **Уведомление включено**\n\n"
+                "Сообщение «Сверка обновлена» будет приходить каждую неделю "
+                "после актуализации сверки.\n\n"
+                "🔕 Отключить: /notify")
+        toast = "🔔 Уведомление включено"
+    else:
+        text = ("🔕 **Еженедельное уведомление отключено**\n\n"
+                "Сообщение «Сверка обновлена» больше не будет приходить.\n\n"
+                "При этом:\n"
+                "• результаты проверки задолженности (кнопка «💳 Долг») приходят "
+                "как раньше — их отключить нельзя;\n"
+                "• рассылки новостей и ответы бота — как раньше.\n\n"
+                "🔔 Включить обратно: /notify")
+        toast = "🔕 Уведомление отключено"
+
+    await bot.send_message(chat_id=chat_id, text=text, format="markdown",
+                           attachments=[create_main_menu(user_id)])
+    if hasattr(event, 'answer'):
+        await event.answer(notification=toast)
 
 
 @dp.message_created(Command('debt'))
@@ -1847,68 +1985,115 @@ async def cmd_userinfo(event: MessageCreated):
     )
 
 
-@dp.message_created(Command('sentlog'))
-async def cmd_sentlog(event: MessageCreated):
-    """Журнал отправок бота: кому и какие массовые сообщения отправлены (только админ)."""
-    user = event.message.sender
-    user_id = user.user_id
-    chat_id = event.message.recipient.chat_id
-    ensure_user(user_id, chat_id, getattr(user, 'username', None), getattr(user, 'first_name', None))
+# Служебные ответы бота (реакции на кнопки и команды) — в проверке доставки
+# не показываем: это не отправки бота «контакту».
+SERVICE_PREFIXES = (
+    "👋 Привет,",                     # приветствие /start
+    "🏠 Главное меню:",              # меню
+    "📋 **Справка**",                # справка
+    "ℹ️ **О боте**",                 # о боте
+    "📋 **Выберите ваш регион**",    # выбор региона («Условия»)
+    "📋 **Условия по ",              # условия по городам
+    "💳 **Проверка долга",           # подсказка ввода ФИО
+    "👤 <b>Данные контакта:",        # карточка /userinfo (HTML)
+    "👤 **Ваши данные:**",           # свои данные
+    "⛔ **Контакт не найден.**",     # userinfo: контакт не найден
+    "📩 **Журнал сообщений**",      # подсказка /checksent и кнопки «Журнал»
+    "🔍 **Журнал сообщений**",      # отчёт проверки (если проверяют свой чат)
+    "❓ Неизвестная команда",        # ошибка
+    "Не понял вас.",                 # фолбэк
+    "✅ **По ",                      # «нет задолженности»
+    "⚠️ **По ",                      # «есть задолженность»
+    "⚠️ **Найдены задолженности",    # долги по магазинам
+)
 
-    if not is_admin(user_id):
-        await event.message.answer("⛔ Эта команда доступна только администратору.")
-        return
+CHECKSENT_SHOW = 5      # сколько последних сообщений бота показывать
+CHECKSENT_COUNT = 50    # сколько последних сообщений чата запрашивать у MAX
 
-    body = getattr(event.message, 'body', None)
-    arg = ''
-    if body and getattr(body, 'text', None):
-        parts = body.text.split()
-        if len(parts) > 1:
-            arg = parts[1].lower()
 
-    # /sentlog clear — очистить журнал
-    if arg in ('clear', 'очистить'):
-        entries = _load_sent_log()
-        try:
-            os.makedirs('data', exist_ok=True)
-            with open(SENT_LOG_FILE, 'w', encoding='utf-8') as f:
-                json.dump([], f, ensure_ascii=False)
-            await event.message.answer(
-                f"🗑 Журнал отправок очищен (удалено записей: {len(entries)}).",
-                attachments=[create_main_menu(user_id)]
-            )
-        except Exception as e:
-            logger.error(f"Не удалось очистить журнал отправок: {e}")
-            await event.message.answer("❌ Не удалось очистить журнал (см. лог).")
-        return
+def _is_service_text(text) -> bool:
+    """True, если текст — служебный ответ бота на кнопку/команду (меню, справка,
+    условия, карточки, подсказки). Такие ответы не показываем в проверке доставки."""
+    if not text:
+        return False
+    return str(text).lstrip().startswith(SERVICE_PREFIXES)
 
-    n = 10
-    if arg.isdigit():
-        n = max(1, min(int(arg), 50))
 
-    entries = _load_sent_log()
-    if not entries:
-        await event.message.answer(
-            "📭 Журнал отправок пуст.\n\n"
-            "Сюда попадают массовые отправки бота: рассылки новостей и уведомления о сверке.",
-            attachments=[create_main_menu(user_id)]
-        )
-        return
+def _msg_snip(m, limit: int = 80) -> str:
+    """Текст сообщения одной строкой (для отчёта проверки доставки)."""
+    mtext = (m.body.text if (m.body is not None and m.body.text) else '')
+    if not mtext:
+        if getattr(m.body, 'attachments', None):
+            return '📎 вложение (без текста)'
+        return '(без текста)'
+    snip = mtext.replace('\n', ' ')
+    if len(snip) > limit:
+        snip = snip[:limit] + '…'
+    return snip
 
-    total = len(entries)
-    shown = entries[-n:]
-    lines = [f"📨 Журнал отправок — последние {len(shown)} из {total}\n"]
-    for e in shown:
-        snippet = (e.get('text') or '').replace('\n', ' ')
-        if len(snippet) > 60:
-            snippet = snippet[:60] + '…'
-        lines.append(
-            f"{e.get('ts', '—')} | {e.get('source', '—')}\n"
-            f"   → {e.get('name', '—')} (ID {e.get('user_id', '—')}): «{snippet}»"
-        )
-    lines.append("\nПолные записи — в файле data/sent_log.json на сервере. "
-                 "Очистить журнал: /sentlog clear")
-    await event.message.answer("\n".join(lines), attachments=[create_main_menu(user_id)])
+
+async def _checksent_report(arg: str) -> str:
+    """Отчёт проверки доставки: ПОСЛЕДНИЕ сообщения бота в чате с контактом
+    по данным MAX (GET /messages, sender.is_bot). Работает и для отправок
+    локального ПО администратора — токен бота тот же.
+
+    ВАЖНО: API возвращает массив «новые первыми» — сортируем по времени,
+    иначе «последние» превращаются в самые старые (баг октября).
+    В отчёте порядок обратный: самое свежее сообщение сверху (№1),
+    самое давнее — пятым."""
+    found = _find_user_by_any_id(int(arg))
+    if found:
+        f_uid, f_data = found
+        target_chat = f_data.get('chat_id') or f_uid
+        name = (f_data.get('full_name') or f_data.get('name') or '—')
+        name = name.replace('*', '').replace('_', '').replace('`', '')
+    else:
+        f_uid = int(arg)
+        target_chat = int(arg)
+        name = '—'
+
+    try:
+        msgs = await bot.get_messages(chat_id=target_chat, count=CHECKSENT_COUNT)
+    except Exception as e:
+        logger.error(f"checksent: история чата {target_chat} не получена: {e}")
+        return (f"❌ **Не удалось получить историю чата {target_chat} у MAX.**\n"
+                f"Причина: `{e}`")
+
+    raw_msgs = list(getattr(msgs, 'messages', None) or [])
+    # API отдаёт «новые первыми» — сортируем по возрастанию времени
+    all_msgs = sorted(raw_msgs, key=lambda m: getattr(m, 'timestamp', 0) or 0)
+
+    bot_msgs_all = [m for m in all_msgs
+                    if getattr(m, 'sender', None) is not None
+                    and getattr(m.sender, 'is_bot', False)]
+    bot_msgs = [m for m in bot_msgs_all
+                if not _is_service_text(m.body.text if m.body else None)]
+
+    lines = [f"🔍 **Журнал сообщений** — {name} (User ID {f_uid}, чат {target_chat})\n"]
+    if not all_msgs:
+        lines.append("❌ MAX не вернул ни одного сообщения для этого чата. "
+                     "Похоже, бот ещё не писал в него и чат пуст.")
+    elif bot_msgs:
+        # bot_msgs отсортированы по возрастанию времени: берём CHECKSENT_SHOW
+        # самых свежих и разворачиваем — №1 (верхняя строка) самое новое,
+        # №5 самое давнее
+        last = list(reversed(bot_msgs))[:CHECKSENT_SHOW]
+        lines.append(f"✅ По данным MAX, бот отправлял в этот чат сообщения "
+                     f"(в выборке: {len(bot_msgs_all)} от бота, "
+                     f"из них не служебных: {len(bot_msgs)}, показываю последние {len(last)}):")
+        for i, m in enumerate(last, 1):
+            lines.append(f"{i}. {_fmt_msg_ts(m.timestamp)} — «{_msg_snip(m)}»")
+    elif bot_msgs_all:
+        lines.append(f"❌ В последних {len(all_msgs)} сообщениях чата реальных отправок "
+                     f"бота нет — только служебные ответы на кнопки/команды "
+                     f"({len(bot_msgs_all)} шт.: меню, справка, условия и т.п.).\n"
+                     "Похоже, рассылка в этот чат не доставлялась "
+                     "(либо она старше последних 50 сообщений).")
+    else:
+        lines.append(f"❌ В последних {len(all_msgs)} сообщениях чата нет сообщений от бота.\n"
+                     "Похоже, сообщение в этот чат не доставлено "
+                     "(либо отправлено в другой чат).")
+    return "\n".join(lines)
 
 
 @dp.message_callback(F.callback.payload == "userinfo")
@@ -1939,6 +2124,103 @@ async def callback_userinfo(event: MessageCallback):
         format="markdown",
         attachments=[create_cancel_menu()]
     )
+
+
+@dp.message_callback(F.callback.payload == "checksent")
+async def callback_checksent(event: MessageCallback):
+    """Кнопка «📨 Журнал» в админ-меню: бот просит ввести ID контакта."""
+    user = event.callback.user
+    user_id = user.user_id
+    chat_id = event.message.recipient.chat_id
+    ensure_user(user_id, chat_id, getattr(user, 'username', None), getattr(user, 'first_name', None))
+
+    if not is_admin(user_id):
+        await event.answer(notification="⛔ Доступно только администратору")
+        await bot.send_message(
+            chat_id=chat_id,
+            text="⛔ Эта функция доступна только администратору.",
+            attachments=[create_main_menu(user_id)]
+        )
+        return
+
+    user_states[user_id] = UserState.WAITING_CHECKSENT_ID
+    await event.answer(notification="📨 Журнал сообщений")
+    await bot.send_message(
+        chat_id=chat_id,
+        text="📩 **Журнал сообщений**\n\n"
+             "Введите User ID или Chat ID контакта цифрами.\n"
+             "Бот запросит у MAX историю чата с контактом.\n\n"
+             "Для отмены нажмите кнопку «Отмена» или введите /cancel.",
+        format="markdown",
+        attachments=[create_cancel_menu()]
+    )
+
+
+def _fmt_msg_ts(ts: int) -> str:
+    """Приводит timestamp сообщения MAX (мс или секунды) к строке МСК."""
+    try:
+        v = ts if ts < 10**11 else ts / 1000.0
+        return datetime.fromtimestamp(v, tz=MSK).strftime('%d.%m.%Y %H:%M:%S')
+    except Exception:
+        return '—'
+
+
+@dp.message_created(Command('checksent'))
+async def cmd_checksent(event: MessageCreated):
+    """Журнал сообщений: история чата с контактом по данным MAX (только админ)."""
+    user = event.message.sender
+    user_id = user.user_id
+    chat_id = event.message.recipient.chat_id
+    ensure_user(user_id, chat_id, getattr(user, 'username', None), getattr(user, 'first_name', None))
+
+    if not is_admin(user_id):
+        await event.message.answer("⛔ Эта команда доступна только администратору.")
+        return
+
+    body = getattr(event.message, 'body', None)
+    text_in = (getattr(body, 'text', None) or '') if body else ''
+    parts = text_in.split()
+    arg = parts[1].strip('`').lstrip('+') if len(parts) > 1 else ''
+    if not arg.isdigit():
+        # Без аргумента — как по кнопке «📨 Журнал»: спрашиваем ID и ждём ввод
+        user_states[user_id] = UserState.WAITING_CHECKSENT_ID
+        await event.message.answer(
+            "📩 **Журнал сообщений**\n\n"
+            "Введите User ID или Chat ID контакта цифрами.\n\n"
+            "Бот запросит у MAX историю чата с контактом и покажет последние "
+            "сообщения бота — так видно, что MAX действительно доставил сообщение.\n\n"
+            "Для отмены нажмите кнопку «Отмена» или введите /cancel.",
+            format="markdown",
+            attachments=[create_cancel_menu()]
+        )
+        return
+
+    report = await _checksent_report(arg)
+    user_states.pop(user_id, None)
+    await event.message.answer(report,
+                               format="markdown",
+                               attachments=[create_main_menu(user_id)])
+
+
+async def process_checksent_input(event, user_id: int, chat_id: int, text: str):
+    """Ввод ID контакта после кнопки «📨 Журнал» или /checksent без аргумента."""
+    stripped = (text or "").strip().strip('`').lstrip('+')
+    if not stripped.isdigit():
+        await event.message.answer(
+            "⚠️ Нужен User ID или Chat ID цифрами.\n"
+            "Пример: `65700242`\n"
+            "Для отмены — /cancel.",
+            format="markdown",
+            attachments=[create_cancel_menu()]
+        )
+        # Состояние не сбрасываем — админ может ввести ID ещё раз
+        return
+
+    report = await _checksent_report(stripped)
+    user_states.pop(user_id, None)
+    await event.message.answer(report,
+                               format="markdown",
+                               attachments=[create_main_menu(user_id)])
 
 
 # ---------- УПРАВЛЕНИЕ АДМИНАМИ ----------
@@ -1984,10 +2266,8 @@ async def cmd_addadmin(event: MessageCreated):
     _save_admins()
     logger.info(f"Владелец назначил админа: {new_id}")
     await event.message.answer(f"✅ Пользователь `{new_id}` назначен администратором.", format="markdown")
-    try:
-        await bot.send_message(chat_id=new_id, text="🎉 Вам выданы права администратора бота.")
-    except Exception:
-        pass
+    await _notify_contact_and_log(new_id, "🎉 Назначение админом",
+                                  "🎉 Вам выданы права администратора бота.")
 
 
 @dp.message_created(Command('deladmin'))
@@ -2024,10 +2304,8 @@ async def cmd_deladmin(event: MessageCreated):
     _save_admins()
     logger.info(f"Владелец снял админа: {del_id}")
     await event.message.answer(f"✅ Права администратора сняты с `{del_id}`.", format="markdown")
-    try:
-        await bot.send_message(chat_id=del_id, text="ℹ️ Права администратора бота отозваны.")
-    except Exception:
-        pass
+    await _notify_contact_and_log(del_id, "ℹ️ Отзыв прав админа",
+                                  "ℹ️ Права администратора бота отозваны.")
 
 
 @dp.message_created(Command('adminlist'))
@@ -2244,7 +2522,7 @@ async def callback_info(event: MessageCallback):
     await event.answer(notification="ℹ️ О боте")
     await bot.send_message(
         chat_id=chat_id,
-        text="ℹ️ **О боте**\n\nВерсия: 1.9\nНазначение: автоматизация новостных рассылок для подписчиков и предоставление общей информации по сотрудничеству.",
+        text="ℹ️ **О боте**\n\nВерсия: 2.0\nНазначение: автоматизация новостных рассылок для подписчиков и предоставление общей информации по сотрудничеству.",
         format="markdown",
         attachments=[create_main_menu(user_id)]
     )
@@ -2768,6 +3046,10 @@ async def handle_text(event: MessageCreated):
         await process_userinfo_input(event, user_id, chat_id, text)
         return
 
+    if state == UserState.WAITING_CHECKSENT_ID:
+        await process_checksent_input(event, user_id, chat_id, text)
+        return
+
     # ВЛАДЕЛЕЦ: ввод ID для кнопок ➕/➖ Админы
     if state == UserState.WAITING_ADDADMIN_ID:
         raw = text.strip().strip('`')
@@ -2807,10 +3089,8 @@ async def handle_text(event: MessageCreated):
             f"✅ Пользователь `{new_id}` назначен администратором.",
             format="markdown",
             attachments=[create_main_menu(user_id)])
-        try:
-            await bot.send_message(chat_id=new_id, text="🎉 Вам выданы права администратора бота.")
-        except Exception:
-            pass
+        await _notify_contact_and_log(new_id, "🎉 Назначение админом",
+                                      "🎉 Вам выданы права администратора бота.")
         return
 
     if state == UserState.WAITING_DELADMIN_ID:
@@ -2844,10 +3124,8 @@ async def handle_text(event: MessageCreated):
             f"✅ Права администратора сняты с `{del_id}`.",
             format="markdown",
             attachments=[create_main_menu(user_id)])
-        try:
-            await bot.send_message(chat_id=del_id, text="ℹ️ Права администратора бота отозваны.")
-        except Exception:
-            pass
+        await _notify_contact_and_log(del_id, "ℹ️ Отзыв прав админа",
+                                      "ℹ️ Права администратора бота отозваны.")
         return
 
     if state == UserState.ADMIN_DEBT_MODE:
@@ -3009,6 +3287,7 @@ async def handle_text(event: MessageCreated):
         sent_count = 0
         error_count = 0
         broadcast_ok: List[tuple] = []
+        broadcast_fail: List[tuple] = []
         logger.info(f"Начинаем рассылку от админа {user_id}, пользователей: {len(users)}")
 
         for uid, user_data in users.items():
@@ -3026,10 +3305,12 @@ async def handle_text(event: MessageCreated):
             except Exception as e:
                 logger.error(f"Не удалось отправить новость пользователю {uid}: {e}")
                 error_count += 1
+                broadcast_fail.append((uid, user_data))
             await asyncio.sleep(0.2)
 
         _log_sent_bulk(broadcast_ok, "📢 Рассылка новостей",
-                       f"📢 **Новость от администратора:**\n\n{text}")
+                       f"📢 **Новость от администратора:**\n\n{text}",
+                       failed=broadcast_fail)
         user_states.pop(user_id, None)
         await event.message.answer(
             f"✅ **Рассылка завершена.**\n"
@@ -3045,7 +3326,7 @@ async def handle_text(event: MessageCreated):
             "👋 Вы администратор. Используйте:\n"
             "• /menu или /start – показать меню с кнопками\n"
             "• /broadcast – для рассылки новостей\n"
-            "• /sentlog – журнал отправок бота (админ)\n"
+            "• /checksent <id> – журнал сообщений контакту (админ)\n"
             "• /userinfo – для получения данных пользователя\n"
             "• /debt или кнопка «Долг» – проверить задолженность по ФИО клиента\n"
             "• /refresh_debt – проверить таблицы сверки сейчас\n"
@@ -3083,6 +3364,13 @@ async def handle_non_text(event: MessageCreated):
         await process_userinfo_input(event, user_id, chat_id, text or "")
         return
 
+    if state == UserState.WAITING_CHECKSENT_ID:
+        await event.message.answer(
+            "⚠️ Нужен User ID или Chat ID цифрами.\nДля отмены — /cancel.",
+            attachments=[create_cancel_menu()]
+        )
+        return
+
     if state in (UserState.ADMIN_DEBT_MODE, UserState.ADMIN_DEBT_CLARIFY_MODE):
         await event.message.answer(
             "⚠️ Введите ФИО текстом.",
@@ -3105,9 +3393,10 @@ async def main():
         BotCommand(name="help", description="Справка"),
         BotCommand(name="debt", description="Долг"),
         BotCommand(name="change_name", description="Сменить ФИО"),
+        BotCommand(name="notify", description="Вкл/выкл уведомление о сверке"),
         BotCommand(name="userinfo", description="ID контакта (админ)"),
         BotCommand(name="broadcast", description="Рассылка (только админ)"),
-        BotCommand(name="sentlog", description="Журнал отправок (админ)"),
+        BotCommand(name="checksent", description="Журнал сообщений (админ)"),
         BotCommand(name="refresh_debt", description="Обновить сверку (админ)"),
         BotCommand(name="debt_status", description="Статус сверки (админ)"),
         BotCommand(name="adminlist", description="Список админов"),
